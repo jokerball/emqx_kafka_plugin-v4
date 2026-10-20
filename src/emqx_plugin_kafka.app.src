@@ -1,0 +1,14 @@
+{application, emqx_plugin_kafka,
+ [{description, "V2.3 EMQX plugin kafka bridge with connection heartbeat. Add Mapping Rules from MQTT Topic to Kafka Topic"},
+  {vsn, "git"},
+  {modules, []},
+  {registered, [emqx_plugin_kafka_sup]},
+  {applications, [kernel,stdlib, brod]},
+  {mod, {emqx_plugin_kafka_app,[]}},
+  {env, []},
+  {licenses, ["Apache-2.0"]},
+  {maintainers, ["Ultrakid <ultrakid@qq.com>", "lyg <3613840847@qq.com>"]},
+  {links,[{"Github","https://github.com/ULTRAKID/emqx_plugin_kafka"}, {"Github","https://github.com/yzs/emqx-plugin-kafka"}]}
+ ]
+}.
+
