@@ -234,6 +234,46 @@ on_message_dropped(Message, _By = #{node := Node}, Reason, _Env) ->
   ok.
 
 
+
+
+%% ------------------------------
+%% 核心路由逻辑（前缀→精确→默认）
+%% ------------------------------
+%% 总路由函数：实现「前缀匹配 → 精确匹配 → 默认兜底」
+-spec get_target_kafka_topic(binary()) -> binary().
+get_target_kafka_topic(MqttTopic) ->
+  %% 步骤1：尝试前缀匹配
+  case get_kafka_topic_by_prefix(MqttTopic) of
+    KafkaTopic when is_binary(KafkaTopic) ->
+      KafkaTopic;
+    _ ->  %% 匹配所有非二进制情况（包括undefined）
+      %% 步骤2：前缀匹配失败，尝试精确匹配
+      case get_kafka_topic_by_mqtt_topic(MqttTopic) of
+        KafkaTopic2 when is_binary(KafkaTopic2) ->
+          KafkaTopic2;
+        _ ->  %% 匹配所有非二进制情况
+          %% 步骤3：均失败，使用默认Topic
+          get_kafka_topic()
+      end
+  end.
+
+%% 前缀匹配：遍历配置的前缀映射表，二进制前缀匹配
+-spec get_kafka_topic_by_prefix(binary()) -> binary() | undefined.
+get_kafka_topic_by_prefix(MqttTopic) ->
+  PrefixMappings = application:get_env(emqx_plugin_kafka, topic_prefix_mapping, []),
+  match_prefix(MqttTopic, PrefixMappings).
+
+%% 内部递归辅助函数：二进制前缀匹配
+-spec match_prefix(binary(), list({binary(), binary()})) -> binary() | undefined.
+match_prefix(_MqttTopic, []) -> undefined;  % 无匹配返回undefined
+match_prefix(MqttTopic, [{Prefix, KafkaTopic} | Rest]) ->
+  PrefixLen = byte_size(Prefix),
+  case MqttTopic of
+    <<Prefix:PrefixLen/binary, _/binary>> -> KafkaTopic;  % 前缀匹配成功
+    _ -> match_prefix(MqttTopic, Rest)  % 继续匹配下一个前缀
+  end.
+
+
 %%---------------------------message publish start--------------------------%%
 on_message_publish(_Message = #message{topic = <<"$SYS/", _/binary>>}, _Env) ->
   ok;
@@ -245,8 +285,16 @@ on_message_publish(Message, _Env) ->
       ?LOG_DEBUG("[KAFKA PLUGIN]on_message_publish by client(~s), topic: ~s is in ignored list, unnecessary to repost to kafka~n",
         [ClientId, Topic]);
     _ ->
+      Headers = Message#message.headers,
+      %% 打印所有 header 内容（用于调试）
+      ?LOG_DEBUG("[KAFKA PLUGIN] Full headers: ~p", [Headers]),
       Username = emqx_message:get_header(username, Message),
       IpAddr = emqx_message:get_header(peerhost, Message),
+      %% 获取Content-Type，如果不存在则使用默认值 application/text
+      Properties = maps:get(properties, Headers, #{}),
+      ContentType = maps:get('Content-Type', Properties, <<"application/text">>),
+      %% 打印获取到的 ContentType 值
+      ?LOG_DEBUG("[KAFKA PLUGIN] ContentType: ~s", [ContentType]),
       % ?LOG_INFO("[KAFKA PLUGIN]Tail= ~s , RawType= ~s~n",[Tail,RawType]),
       Content = transform_payload(Message#message.payload),
       Payload = [{action, message_publish},
@@ -255,10 +303,11 @@ on_message_publish(Message, _Env) ->
         {username, Username},
         {topic, Topic},
         {payload, Content},
+        {content_type, ContentType},
         {cluster_node, node()},
         {ts, Message#message.timestamp}],
       %% 根据 MQTT Topic 获取对应的 Kafka Topic
-      KafkaTopic = get_kafka_topic_by_mqtt_topic(Topic),
+      KafkaTopic = get_target_kafka_topic(Topic),
       %% 发送消息到 Kafka
       produce_kafka_payload_by_kafka_topic(ClientId, Payload, KafkaTopic)
   end,
@@ -340,7 +389,7 @@ on_message_acked(_ClientInfo = #{clientid := ClientId}, Message, _Env) ->
 topic_in_ignored_list(Topic) ->
   IgnoreList = application:get_env(emqx_plugin_kafka, mqtt_topic_pattern_ignored_list, []),
   lists:any(fun(Pattern) ->
-              topic_pattern_match(Topic, Pattern)
+    topic_pattern_match(Topic, Pattern)
             end,
     IgnoreList).
 
@@ -374,11 +423,39 @@ on_session_created(#{clientid := ClientId}, SessInfo, _Env) ->
 
 on_session_subscribed(#{clientid := ClientId}, Topic, SubOpts, _Env) ->
   ?LOG_INFO("[KAFKA PLUGIN]Session(~s) subscribed ~s with subopts: ~p~n", [ClientId, Topic, SubOpts]),
-  ok.
+  case application:get_env(emqx_plugin_kafka, on_session_subscribed) of
+    {ok, _TopicConfig} ->
+      Qos = maps:get(qos, SubOpts),
+      Payload = [
+        {device_id, ClientId},
+        {action, <<"subscribed">>},
+        {topic, Topic},
+        {qos, Qos},
+        {ts, now_mill_secs()},
+        {cluster_node, node()}
+      ],
+      produce_kafka_payload(ClientId, Payload, on_session_subscribed),
+      ok;
+    _ -> ok
+  end.
 
 on_session_unsubscribed(#{clientid := ClientId}, Topic, Opts, _Env) ->
   ?LOG_INFO("[KAFKA PLUGIN]Session(~s) unsubscribed ~s with opts: ~p~n", [ClientId, Topic, Opts]),
-  ok.
+  case application:get_env(emqx_plugin_kafka, on_session_unsubscribed) of
+    {ok, _TopicConfig} ->
+      Qos = maps:get(qos, Opts),
+      Payload = [
+        {device_id, ClientId},
+        {action, <<"unsubscribed">>},
+        {topic, Topic},
+        {qos, Qos},
+        {ts, now_mill_secs()},
+        {cluster_node, node()}
+      ],
+      produce_kafka_payload(ClientId, Payload, on_session_unsubscribed),
+      ok;
+    _ -> ok
+  end.
 
 on_session_resumed(#{clientid := ClientId}, SessInfo, _Env) ->
   ?LOG_NOTICE("[KAFKA PLUGIN]Session(~s) resumed, Session Info:~n~p~n", [ClientId, SessInfo]),
@@ -435,12 +512,11 @@ transform_payload(Payload) ->
   NeedBase64 = need_base64(),
   if
     NeedBase64 == true ->
-      %% base64:encode/1 直接返回 binary，避免 encode_to_string/1 生成的中间
-      %% Erlang 字符串（list，每个字符约 8 字节开销）再经 list_to_binary 转换
-      base64:encode(Payload);
+      Content = list_to_binary(base64:encode_to_string(Payload));
     NeedBase64 == false ->
-      Payload
-  end.
+      Content = Payload
+  end,
+  Content.
 
 
 %% Called when the plugin application stop
