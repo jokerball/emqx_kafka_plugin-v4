@@ -435,11 +435,12 @@ transform_payload(Payload) ->
   NeedBase64 = need_base64(),
   if
     NeedBase64 == true ->
-      Content = list_to_binary(base64:encode_to_string(Payload));
+      %% base64:encode/1 直接返回 binary，避免 encode_to_string/1 生成的中间
+      %% Erlang 字符串（list，每个字符约 8 字节开销）再经 list_to_binary 转换
+      base64:encode(Payload);
     NeedBase64 == false ->
-      Content = Payload
-  end,
-  Content.
+      Payload
+  end.
 
 
 %% Called when the plugin application stop
