@@ -32,5 +32,12 @@ init([]) ->
               shutdown => 5000,
               type => worker,
               modules => [emqx_plugin_kafka_queue]},
-    {ok, { {one_for_one, 5, 10}, [Queue] }}.
+    Workers = [#{id => Name,
+                 start => {emqx_plugin_kafka_worker, start_link, [Name]},
+                 restart => permanent,
+                 shutdown => 5000,
+                 type => worker,
+                 modules => [emqx_plugin_kafka_worker]}
+               || Name <- tuple_to_list(emqx_plugin_kafka_queue:worker_names())],
+    {ok, { {one_for_one, 5, 10}, [Queue | Workers] }}.
 

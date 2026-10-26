@@ -74,6 +74,7 @@
 %% Called when the plugin application start
 load(Env) ->
   kafka_init([Env]),
+  init_forward_switches(),
   emqx:hook('client.heartbeat', {?MODULE, on_client_heartbeat, [Env]}),
 
   emqx:hook('client.connect', {?MODULE, on_client_connect, [Env]}),
@@ -330,6 +331,12 @@ on_message_publish(Message, _Env) ->
 on_message_delivered(_ClientInfo, _Message = #message{topic = <<"$SYS/", _/binary>>}, _Env) ->
   ok;
 on_message_delivered(_ClientInfo = #{clientid := ClientId}, Message, _Env) ->
+  case forward_enabled(on_message_delivered) of
+    true -> do_message_delivered(ClientId, Message);
+    false -> ok
+  end.
+
+do_message_delivered(ClientId, Message) ->
   %%  减少非info级别下emqx_message:format的开销
   case logger:allow(info, ?MODULE) of
     true ->
@@ -366,6 +373,12 @@ on_message_delivered(_ClientInfo = #{clientid := ClientId}, Message, _Env) ->
 on_message_acked(_ClientInfo, _Message = #message{topic = <<"$SYS/", _/binary>>}, _Env) ->
   ok;
 on_message_acked(_ClientInfo = #{clientid := ClientId}, Message, _Env) ->
+  case forward_enabled(on_message_acked) of
+    true -> do_message_acked(ClientId, Message);
+    false -> ok
+  end.
+
+do_message_acked(ClientId, Message) ->
   %%  减少非info级别下emqx_message:format的开销
   case logger:allow(info, ?MODULE) of
     true ->
@@ -556,6 +569,18 @@ unload() ->
   emqx:unhook('message.acked', {?MODULE, on_message_acked}),
   emqx:unhook('message.dropped', {?MODULE, on_message_dropped}),
   brod:stop_client(emqx_repost_worker).
+
+%% delivered / acked 默认不转发：一条 MQTT 消息被 N 个订阅者消费时，这两个钩子
+%% 会把 Kafka 写入量放大到 1 + 2N 倍，大连接量场景下按需开启。
+init_forward_switches() ->
+  persistent_term:put({?MODULE, on_message_delivered},
+    application:get_env(emqx_plugin_kafka, forward_delivered, false)),
+  persistent_term:put({?MODULE, on_message_acked},
+    application:get_env(emqx_plugin_kafka, forward_acked, false)),
+  ok.
+
+forward_enabled(Event) ->
+  persistent_term:get({?MODULE, Event}, false).
 
 produce_kafka_payload(Key, Message, Event) ->
   enqueue_kafka(get_kafka_topic(Event), Key, Message).
