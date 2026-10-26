@@ -26,7 +26,10 @@ Plugin Config
 
 - `queue_max_len` / `queue_max_bytes`：队列条数和字节数上限，超过任一上限直接丢弃并计数，hook 永不阻塞；
 - `queue_report_interval`：丢弃/发送失败统计的告警间隔（ms）。日志中出现 `queue overflow` 或 `produce to kafka failed` 即说明 Kafka 侧异常；
-- 生产者参数（`required_acks`、`max_retries`、`partition_buffer_limit`、`retry_backoff_ms` 等）必须写在 `kafka_config` 的 `default_producer_config` 里；写在顶层 brod 会静默忽略。插件启动时会把旧配置里的顶层生产者参数自动迁移进去，并打印 notice 日志。
+- `produce_timeout` / `fail_threshold` / `probe_interval`：worker 侧熔断参数。单条消息写入等待超过 `produce_timeout` 计一次失败，连续失败 `fail_threshold` 次后熔断；熔断期间 hook 直接丢弃、已入队消息快速丢完，每隔 `probe_interval` 放行一次探测，探测成功即自动恢复。日志中出现 `breaker open` / `breaker half-open` / `breaker closed` 可跟踪熔断状态；
+- 生产者参数（`required_acks`、`max_retries`、`partition_buffer_limit`、`retry_backoff_ms` 等）必须写在 `kafka_config` 的 `default_producer_config` 里；写在顶层 brod 会静默忽略。插件启动时会把旧配置里的顶层生产者参数自动迁移进去，并打印 notice 日志；
+- 队列统计（`emqx_plugin_kafka_queue:stats/0`）中的 `buffered` 表示已进入 brod 缓冲，`acked` 表示已收到 Kafka 确认；`required_acks = 0` 时 Kafka 不回确认，`acked` 恒为 0。
+
 
 Authentication and ACL
 ----------------------
