@@ -121,7 +121,11 @@ produce_to(Pid, Key, Payload) ->
     CallRef = #brod_call_ref{caller = self(), callee = Pid, ref = Mref},
     %% AckCb 必须是 fun/2：传 undefined 时 acked 回执会被 send 到本进程邮箱
     AckCb = fun(_Partition, _BaseOffset) -> emqx_plugin_kafka_queue:note_acked() end,
-    Pid ! {produce, CallRef, [{Key, Payload}], AckCb},
+    %% brod 3.16 的批次单元是 map（#{ts, key, value}），不是 {Key, Value} 元组，
+    %% 直接传元组会让 brod_producer 在 brod_utils:bytes/1 处 function_clause 崩溃。
+    %% 用 brod 自己的构造函数，避免与内部格式耦合。
+    Batch = brod_utils:make_batch_input(Key, Payload),
+    Pid ! {produce, CallRef, Batch, AckCb},
     receive
         #brod_produce_reply{call_ref = #brod_call_ref{ref = Mref},
                             result = ?BROD_PRODUCE_REQ_BUFFERED} ->
