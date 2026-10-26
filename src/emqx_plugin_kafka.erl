@@ -27,6 +27,19 @@
 
 -export([load/1, unload/0]).
 
+%% brod 只认 default_producer_config 里的生产者参数，放在 client 配置顶层会被静默忽略
+-define(PRODUCER_CONFIG_KEYS,
+  [required_acks, ack_timeout, max_retries, retry_backoff_ms,
+   partition_buffer_limit, partition_onwire_limit, max_batch_size,
+   max_linger_ms, max_linger_count, compression]).
+
+-define(DEFAULT_PRODUCER_CONFIG,
+  [{partition_buffer_limit, 128},
+   {retry_backoff_ms, 500},
+   {max_retries, 0},
+   {required_acks, 0},
+   {ack_timeout, 1000}]).
+
 %% Client Lifecircle Hooks
 -export([on_client_connect/3
   , on_client_connack/4
@@ -479,7 +492,7 @@ kafka_init(_Env) ->
   {ok, AddressList} = application:get_env(emqx_plugin_kafka, kafka_address_list),
   ?LOG_NOTICE("[KAFKA PLUGIN]KafkaAddressList = ~p~n", [AddressList]),
   {ok, OriKafkaConfig} = application:get_env(emqx_plugin_kafka, kafka_config),
-  KafkaConfig = OriKafkaConfig ++ [{auto_start_producers, true}],
+  KafkaConfig = normalize_kafka_config(OriKafkaConfig) ++ [{auto_start_producers, true}],
   ?LOG_NOTICE("[KAFKA PLUGIN]KafkaConfig = ~p~n", [KafkaConfig]),
   {ok, KafkaTopic} = application:get_env(emqx_plugin_kafka, topic),
   ?LOG_NOTICE("[KAFKA PLUGIN]KafkaTopic = ~s~n", [KafkaTopic]),
@@ -545,19 +558,52 @@ unload() ->
   brod:stop_client(emqx_repost_worker).
 
 produce_kafka_payload(Key, Message, Event) ->
-  Topic = get_kafka_topic(Event),
-  {ok, MessageBody} = emqx_json:safe_encode(Message),
-  % ?LOG_INFO("[KAFKA PLUGIN]Message = ~s~n",[MessageBody]),
-  Payload = iolist_to_binary(MessageBody),
-  brod:produce_cb(emqx_repost_worker, Topic, hash, Key, Payload, fun(_,_) -> ok end),
-  ok.
+  enqueue_kafka(get_kafka_topic(Event), Key, Message).
 
 produce_kafka_payload_by_kafka_topic(Key, Message, KafkaTopic) ->
-  {ok, MessageBody} = emqx_json:safe_encode(Message),
-  % ?LOG_INFO("[KAFKA PLUGIN]Message = ~s~n",[MessageBody]),
-  Payload = iolist_to_binary(MessageBody),
-  brod:produce_cb(emqx_repost_worker, KafkaTopic, hash, Key, Payload, fun(_,_) -> ok end),
-  ok.
+  enqueue_kafka(KafkaTopic, Key, Message).
+
+%% hook 里只做「满队列预判 + JSON 编码 + 入队」，绝不直接调用 brod
+enqueue_kafka(Topic, Key, Message) ->
+  case emqx_plugin_kafka_queue:full() of
+    true ->
+      emqx_plugin_kafka_queue:drop(),
+      ok;
+    false ->
+      case emqx_json:safe_encode(Message) of
+        {ok, MessageBody} ->
+          _ = emqx_plugin_kafka_queue:push(Topic, Key, iolist_to_binary(MessageBody)),
+          ok;
+        {error, Reason} ->
+          ?LOG_WARNING("[KAFKA PLUGIN]failed to encode payload for topic ~s: ~p",
+            [Topic, Reason]),
+          ok
+      end
+  end.
+
+normalize_kafka_config(Config) ->
+  {ProducerCfg, ClientCfg} =
+    lists:partition(fun({Key, _}) -> lists:member(Key, ?PRODUCER_CONFIG_KEYS) end, Config),
+  case lists:keymember(default_producer_config, 1, ClientCfg) of
+    true ->
+      case ProducerCfg of
+        [] -> ClientCfg;
+        _ ->
+          ?LOG_WARNING("[KAFKA PLUGIN]top level producer options ~p are ignored, "
+            "please move them into default_producer_config",
+            [[K || {K, _} <- ProducerCfg]]),
+          ClientCfg
+      end;
+    false ->
+      case ProducerCfg of
+        [] ->
+          ClientCfg ++ [{default_producer_config, ?DEFAULT_PRODUCER_CONFIG}];
+        _ ->
+          ?LOG_NOTICE("[KAFKA PLUGIN]producer options ~p moved into default_producer_config",
+            [[K || {K, _} <- ProducerCfg]]),
+          ClientCfg ++ [{default_producer_config, ProducerCfg ++ ?DEFAULT_PRODUCER_CONFIG}]
+      end
+  end.
 
 ntoa({0, 0, 0, 0, 0, 16#ffff, AB, CD}) ->
   inet_parse:ntoa({AB bsr 8, AB rem 256, CD bsr 8, CD rem 256});

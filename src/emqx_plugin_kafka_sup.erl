@@ -26,5 +26,11 @@ start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 init([]) ->
-    {ok, { {one_for_all, 0, 1}, []} }.
+    Queue = #{id => emqx_plugin_kafka_queue,
+              start => {emqx_plugin_kafka_queue, start_link, []},
+              restart => permanent,
+              shutdown => 5000,
+              type => worker,
+              modules => [emqx_plugin_kafka_queue]},
+    {ok, { {one_for_one, 5, 10}, [Queue] }}.
 

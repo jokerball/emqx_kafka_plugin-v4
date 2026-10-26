@@ -20,6 +20,14 @@ Plugin Config
 
 配置文件模板及说明见`etc/emqx_plugin_kafka.config`
 
+### Kafka 写入与内存保护
+
+所有 hook 只把消息写入本地有界队列（`emqx_plugin_kafka_queue`），由独立 worker 进程异步写 Kafka，避免 Kafka 抖动时阻塞 MQTT 连接进程：
+
+- `queue_max_len` / `queue_max_bytes`：队列条数和字节数上限，超过任一上限直接丢弃并计数，hook 永不阻塞；
+- `queue_report_interval`：丢弃/发送失败统计的告警间隔（ms）。日志中出现 `queue overflow` 或 `produce to kafka failed` 即说明 Kafka 侧异常；
+- 生产者参数（`required_acks`、`max_retries`、`partition_buffer_limit`、`retry_backoff_ms` 等）必须写在 `kafka_config` 的 `default_producer_config` 里；写在顶层 brod 会静默忽略。插件启动时会把旧配置里的顶层生产者参数自动迁移进去，并打印 notice 日志。
+
 Authentication and ACL
 ----------------------
 

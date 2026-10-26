@@ -2,7 +2,7 @@
  [{description, "V2.3 EMQX plugin kafka bridge with connection heartbeat. Add Mapping Rules from MQTT Topic to Kafka Topic"},
   {vsn, "git"},
   {modules, []},
-  {registered, [emqx_plugin_kafka_sup]},
+  {registered, [emqx_plugin_kafka_sup, emqx_plugin_kafka_queue]},
   {applications, [kernel,stdlib, brod]},
   {mod, {emqx_plugin_kafka_app,[]}},
   {env, []},
