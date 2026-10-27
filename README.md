@@ -25,14 +25,34 @@ Plugin Config
 所有 hook 只把消息写入本地有界队列（`emqx_plugin_kafka_queue`），再由一组 worker 进程（`emqx_plugin_kafka_worker`）异步写 Kafka，避免 Kafka 抖动时阻塞 MQTT 连接进程：
 
 - `queue_workers`：worker 进程数，按 `device_id` 哈希分片，同一设备的消息固定落在同一个 worker，保证单设备顺序；吞吐随 worker 数线性提升；
-- `queue_max_len` / `queue_max_bytes`：队列条数和字节数上限，超过任一上限直接丢弃并计数，hook 永不阻塞；
-- `queue_report_interval`：丢弃/发送失败统计的告警间隔（ms）。日志中出现 `queue overflow or breaker open` 或 `produce to kafka failed` 即说明 Kafka 侧异常；
-- `produce_timeout` / `fail_threshold` / `probe_interval`：worker 侧熔断参数。单条消息写入等待超过 `produce_timeout` 计一次失败，单个 worker 连续失败 `fail_threshold` 次后熔断；熔断期间 hook 直接丢弃、已入队消息快速丢完，每隔 `probe_interval` 放行一次探测，探测成功即自动恢复。日志中出现 `breaker open` / `breaker half-open` / `breaker closed` 可跟踪熔断状态；
+- `queue_max_len` / `queue_max_bytes`：队列条数和字节数上限，超过任一上限直接丢弃并按原因计数，hook 永不阻塞；
+- `queue_report_interval`：丢弃/发送失败统计的告警间隔（ms）。日志中会输出 `full_len` / `full_bytes` / `unavailable` / `probe` / `breaker_open` 五类丢弃归因；
+- `batch_max_count` / `batch_max_bytes`：worker 单次提交到 Kafka 的条数与字节上限。worker 会先从本地 FIFO 取一批、再从邮箱里把已到达的消息并进同一批，按 `{Topic, Partition}` 分组后**每组只做一次 monitor/send/receive**，把「每条一次」的调度开销摊薄到「每组一次」，这是降低 CPU 的主要手段。邮箱为空时不会等待，单条消息的延迟不变；`batch_max_bytes` 必须明显小于 `default_producer_config` 的 `max_batch_size`，否则加上批次头开销会触发 `RecordTooLargeException`；
+- `produce_timeout` / `fail_threshold` / `probe_interval` / `probe_per_worker`：worker 侧熔断参数。**同一批内的所有分组共用一个 `produce_timeout` 预算**，不会出现「组数 × 超时」的放大；单个 worker 连续失败 `fail_threshold` 次后熔断，worker 本地也会按同阈值前置挂起，避免 Kafka 快速失败时把邮箱里的消息逐条烧完。**熔断只决定「发不发 Kafka」，不决定「收不收已入队消息」**：已入队消息 park 在 worker 本地 FIFO，恢复后按序补发；每隔 `probe_interval` 广播一次探测，每个 worker 只放行 `probe_per_worker` 条真实消息，探测成功即关闭熔断并 drain；探测窗口内若没有任何 worker 上报结果（例如 pending 为空），保底超时会自动回退到 open 并重新调度，不会卡在 probing。日志中出现 `breaker open` / `breaker closed` 可跟踪状态；
+- `breaker_action`：熔断打开时**新到达**消息的处理方式，默认 `drop`（直接丢弃，计入 `dropped_breaker_open`），避免恢复后一次性补发一批已经过期的心跳/事件；设为 `park` 则照常入队，恢复后按序补发。已入队的消息不受该项影响，永远走 park/drain；
+- `worker_message_queue_data`：`on_heap`（默认）或 `off_heap`，积压场景可切 `off_heap` 做 A/B；
 - `forward_delivered` / `forward_acked`：是否转发 `message.delivered` / `message.acked` 事件，默认关闭。一条 MQTT 消息被 N 个订阅者消费时，这两个钩子会把 Kafka 写入量放大到 `1 + 2N` 倍；
 - 生产者参数（`required_acks`、`max_retries`、`partition_buffer_limit`、`retry_backoff_ms`、`max_linger_ms`、`max_batch_size` 等）必须写在 `kafka_config` 的 `default_producer_config` 里；写在顶层 brod 会静默忽略。插件启动时会把旧配置里的顶层生产者参数自动迁移进去，并打印 notice 日志；
-- 队列统计（`emqx_plugin_kafka_queue:stats/0`）中的 `buffered` 表示已进入 brod 缓冲，`acked` 表示已收到 Kafka 确认；`required_acks = 0` 时 Kafka 不回确认，`acked` 恒为 0。
+- 队列统计（`emqx_plugin_kafka_queue:stats/0`）：`queued` / `queued_bytes` 为当前积压，`buffered` 表示已进入 brod 缓冲，`acked` 表示已收到 Kafka 确认，`inflight = buffered - acked` 用于观测静默丢失；`failed` 细分为 `failed_timeout` / `failed_producer_down` / `failed_get_producer`，`dropped` 细分为 `dropped_full_len` / `dropped_full_bytes` / `dropped_unavailable` / `dropped_probe` / `dropped_breaker_open`，另有 `producer_down`、`breaker_open_count`、`breaker_open_ms`、`breaker_action`、`batch_max_count`、`batch_max_bytes`。`required_acks = 0` 时 Kafka 不回确认，`acked` 恒为 0。`queued` 是额度口径（提交超时即归还），`buffered`/`acked` 是 brod 口径；超时后才收到 buffered 回执的消息（批量模式下按组内条数）单列在 `late_buffered`。`lost = failed - late_buffered` 是提交失败且回执始终没到的条数，也就是真实丢失量，端到端对账用两个等式：`入队总量 = queued + buffered + lost`、`上游总量 = 入队总量 + dropped`。注意 `fail_threshold` 统计的是**连续失败的提交次数**，不是失败消息条数——批量提交一次失败可能涉及上百条，按条累加会让阈值失去意义。
 
 
+
+### 采样命令（emqx_ctl）
+
+插件加载时注册 `kafka` 命令，压测采样不需要再进远程 shell：
+
+```
+emqx_ctl kafka stats     # 一行一个 key=value，覆盖队列/熔断/丢弃/丢失全部计数
+emqx_ctl kafka workers   # 各 worker 邮箱长度 + max/min/avg，用于判断分片倾斜
+```
+
+`stats` 的输出可直接用 `grep`/`awk` 解析做时序采样，例如每 10 秒采一次 `queued`、`dropped`、`lost`、`breaker`：
+
+```
+while true; do emqx_ctl kafka stats | grep -E '^(queued|dropped|lost|breaker) '; sleep 10; done
+```
+
+`workers` 只读 `process_info/2`，不会向正在等 produce 回执的 worker 发 `gen_server:call`，因此采样本身不会被阻塞的 worker 拖住。
 
 Authentication and ACL
 ----------------------

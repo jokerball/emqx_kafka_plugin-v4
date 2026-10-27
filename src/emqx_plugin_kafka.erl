@@ -33,12 +33,24 @@
    partition_buffer_limit, partition_onwire_limit, max_batch_size,
    max_linger_ms, max_linger_count, compression]).
 
+%% 配置缺失时的兜底值：绝不能是 acks=0 / max_retries=0。
+%% acks=0 时既观测不到 broker 侧错误，acked 统计也永远为 0；
+%% max_retries=0 会让任何一次抖动都直接判失败，且 brod 缓冲里的消息会静默丢失。
 -define(DEFAULT_PRODUCER_CONFIG,
-  [{partition_buffer_limit, 128},
+  [{partition_buffer_limit, 1024},
+   {partition_onwire_limit, 8},
    {retry_backoff_ms, 500},
-   {max_retries, 0},
-   {required_acks, 0},
-   {ack_timeout, 1000}]).
+   {max_retries, 100},
+   {required_acks, 1},
+   {ack_timeout, 1500},
+   {max_linger_ms, 30},
+   {max_linger_count, 1000},
+   {max_batch_size, 262144}]).
+
+%% 支持按事件单独配置 Kafka topic 的 hook
+-define(CONFIGURED_EVENTS,
+  [on_client_heartbeat, on_message_publish, on_message_delivered,
+   on_message_acked, on_session_subscribed, on_session_unsubscribed]).
 
 %% Client Lifecircle Hooks
 -export([on_client_connect/3
@@ -75,6 +87,8 @@
 load(Env) ->
   kafka_init([Env]),
   init_forward_switches(),
+  init_config_cache(),
+  emqx_ctl:register_command(kafka, {emqx_cli_kafka, cmd}, []),
   emqx:hook('client.heartbeat', {?MODULE, on_client_heartbeat, [Env]}),
 
   emqx:hook('client.connect', {?MODULE, on_client_connect, [Env]}),
@@ -274,7 +288,7 @@ get_target_kafka_topic(MqttTopic) ->
 %% 前缀匹配：遍历配置的前缀映射表，二进制前缀匹配
 -spec get_kafka_topic_by_prefix(binary()) -> binary() | undefined.
 get_kafka_topic_by_prefix(MqttTopic) ->
-  PrefixMappings = application:get_env(emqx_plugin_kafka, topic_prefix_mapping, []),
+  PrefixMappings = persistent_term:get({?MODULE, topic_prefix_mapping}, []),
   match_prefix(MqttTopic, PrefixMappings).
 
 %% 内部递归辅助函数：二进制前缀匹配
@@ -413,7 +427,7 @@ do_message_acked(ClientId, Message) ->
   ok.
 
 topic_in_ignored_list(Topic) ->
-  IgnoreList = application:get_env(emqx_plugin_kafka, mqtt_topic_pattern_ignored_list, []),
+  IgnoreList = persistent_term:get({?MODULE, ignore_list}, []),
   lists:any(fun(Pattern) ->
     topic_pattern_match(Topic, Pattern)
             end,
@@ -428,13 +442,9 @@ topic_pattern_match(Topic, Pattern) ->
 
 %% 根据 MQTT Topic 获取对应的 Kafka Topic
 get_kafka_topic_by_mqtt_topic(MqttTopic) ->
-  %% 获取配置文件中的 topic_mapping
-  TopicMapping = application:get_env(emqx_plugin_kafka, topic_mapping, []),
-  DefaultTopic = get_kafka_topic(),
-  %% 查找匹配的 Kafka Topic
-  case lists:keyfind(MqttTopic, 1, TopicMapping) of
-    {MqttTopic, KafkaTopic} -> KafkaTopic;
-    false -> DefaultTopic
+  case maps:find(MqttTopic, persistent_term:get({?MODULE, topic_mapping_map}, #{})) of
+    {ok, KafkaTopic} -> KafkaTopic;
+    error -> get_kafka_topic()
   end.
 
 
@@ -449,8 +459,8 @@ on_session_created(#{clientid := ClientId}, SessInfo, _Env) ->
 
 on_session_subscribed(#{clientid := ClientId}, Topic, SubOpts, _Env) ->
   ?LOG_INFO("[KAFKA PLUGIN]Session(~s) subscribed ~s with subopts: ~p~n", [ClientId, Topic, SubOpts]),
-  case application:get_env(emqx_plugin_kafka, on_session_subscribed) of
-    {ok, _TopicConfig} ->
+  case event_configured(on_session_subscribed) of
+    true ->
       Qos = maps:get(qos, SubOpts),
       Payload = [
         {device_id, ClientId},
@@ -467,8 +477,8 @@ on_session_subscribed(#{clientid := ClientId}, Topic, SubOpts, _Env) ->
 
 on_session_unsubscribed(#{clientid := ClientId}, Topic, Opts, _Env) ->
   ?LOG_INFO("[KAFKA PLUGIN]Session(~s) unsubscribed ~s with opts: ~p~n", [ClientId, Topic, Opts]),
-  case application:get_env(emqx_plugin_kafka, on_session_unsubscribed) of
-    {ok, _TopicConfig} ->
+  case event_configured(on_session_unsubscribed) of
+    true ->
       Qos = maps:get(qos, Opts),
       Payload = [
         {device_id, ClientId},
@@ -520,33 +530,28 @@ kafka_init(_Env) ->
 
 get_kafka_topic() ->
   %% 默认的kafka topic
-  {ok, Topic} = application:get_env(emqx_plugin_kafka, topic),
-  Topic.
+  persistent_term:get({?MODULE, topic}, <<"emqx-topic">>).
 
 get_kafka_topic(Event) ->
   %% 不同事件特定的topic
-  case application:get_env(emqx_plugin_kafka, Event) of
-    {ok, Topic} -> Topic;
-    _ -> get_kafka_topic()
-  end.
+  maps:get(Event, persistent_term:get({?MODULE, event_topics}, #{}), get_kafka_topic()).
+
+event_configured(Event) ->
+  maps:is_key(Event, persistent_term:get({?MODULE, event_topics}, #{})).
 
 need_base64() ->
-  {ok, NeedBase64} = application:get_env(emqx_plugin_kafka, publish_base64),
-  NeedBase64.
+  persistent_term:get({?MODULE, publish_base64}, false).
 
 transform_payload(Payload) ->
-  NeedBase64 = need_base64(),
-  if
-    NeedBase64 == true ->
-      Content = list_to_binary(base64:encode_to_string(Payload));
-    NeedBase64 == false ->
-      Content = Payload
-  end,
-  Content.
+  case need_base64() of
+    true -> base64:encode(Payload);
+    false -> Payload
+  end.
 
 
 %% Called when the plugin application stop
 unload() ->
+  emqx_ctl:unregister_command(kafka),
   emqx:unhook('client.heartbeat', {?MODULE, on_client_heartbeat}),
 
   emqx:unhook('client.connect', {?MODULE, on_client_connect}),
@@ -568,7 +573,8 @@ unload() ->
   emqx:unhook('message.delivered', {?MODULE, on_message_delivered}),
   emqx:unhook('message.acked', {?MODULE, on_message_acked}),
   emqx:unhook('message.dropped', {?MODULE, on_message_dropped}),
-  brod:stop_client(emqx_repost_worker).
+  brod:stop_client(emqx_repost_worker),
+  erase_config_cache().
 
 %% delivered / acked 默认不转发：一条 MQTT 消息被 N 个订阅者消费时，这两个钩子
 %% 会把 Kafka 写入量放大到 1 + 2N 倍，大连接量场景下按需开启。
@@ -579,6 +585,29 @@ init_forward_switches() ->
     application:get_env(emqx_plugin_kafka, forward_acked, false)),
   ok.
 
+%% 路由/过滤/base64 配置在热路径上每条消息都要读，加载时缓存到 persistent_term
+init_config_cache() ->
+  {ok, Topic} = application:get_env(emqx_plugin_kafka, topic),
+  TopicMapping = application:get_env(emqx_plugin_kafka, topic_mapping, []),
+  PrefixMappings = application:get_env(emqx_plugin_kafka, topic_prefix_mapping, []),
+  IgnoreList = application:get_env(emqx_plugin_kafka, mqtt_topic_pattern_ignored_list, []),
+  EventTopics = maps:from_list(
+    [{Event, Topic0} || Event <- ?CONFIGURED_EVENTS,
+                        {ok, Topic0} <- [application:get_env(emqx_plugin_kafka, Event)]]),
+  persistent_term:put({?MODULE, topic}, Topic),
+  persistent_term:put({?MODULE, topic_mapping_map}, maps:from_list(TopicMapping)),
+  persistent_term:put({?MODULE, topic_prefix_mapping}, PrefixMappings),
+  persistent_term:put({?MODULE, ignore_list}, IgnoreList),
+  persistent_term:put({?MODULE, publish_base64},
+    application:get_env(emqx_plugin_kafka, publish_base64, false)),
+  persistent_term:put({?MODULE, event_topics}, EventTopics),
+  ok.
+
+erase_config_cache() ->
+  lists:foreach(fun(Key) -> persistent_term:erase({?MODULE, Key}) end,
+    [topic, topic_mapping_map, topic_prefix_mapping, ignore_list,
+     publish_base64, event_topics, on_message_delivered, on_message_acked]).
+
 forward_enabled(Event) ->
   persistent_term:get({?MODULE, Event}, false).
 
@@ -588,13 +617,10 @@ produce_kafka_payload(Key, Message, Event) ->
 produce_kafka_payload_by_kafka_topic(Key, Message, KafkaTopic) ->
   enqueue_kafka(KafkaTopic, Key, Message).
 
-%% hook 里只做「满队列预判 + JSON 编码 + 入队」，绝不直接调用 brod
+%% hook 里只做「容量判断 + JSON 编码 + 入队」，绝不直接调用 brod
 enqueue_kafka(Topic, Key, Message) ->
-  case emqx_plugin_kafka_queue:full() of
-    true ->
-      emqx_plugin_kafka_queue:drop(),
-      ok;
-    false ->
+  case emqx_plugin_kafka_queue:full_reason() of
+    ok ->
       case emqx_json:safe_encode(Message) of
         {ok, MessageBody} ->
           _ = emqx_plugin_kafka_queue:push(Topic, Key, iolist_to_binary(MessageBody)),
@@ -603,7 +629,10 @@ enqueue_kafka(Topic, Key, Message) ->
           ?LOG_WARNING("[KAFKA PLUGIN]failed to encode payload for topic ~s: ~p",
             [Topic, Reason]),
           ok
-      end
+      end;
+    {drop, Reason} ->
+      emqx_plugin_kafka_queue:drop(Reason),
+      ok
   end.
 
 normalize_kafka_config(Config) ->
