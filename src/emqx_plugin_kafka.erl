@@ -524,6 +524,9 @@ kafka_init(_Env) ->
   Prop = application:get_all_env(emqx_plugin_kafka),
   ?LOG_NOTICE("[KAFKA PLUGIN]All config = ~p~n", [Prop]),
   {ok, _} = application:ensure_all_started(brod),
+  %% client 级兜底恢复需要在运行时重建 client，把启动参数留在 persistent_term
+  persistent_term:put({emqx_plugin_kafka, kafka_client_config},
+                      {AddressList, KafkaConfig}),
   ok = brod:start_client(AddressList, emqx_repost_worker, KafkaConfig),
   ?LOG_NOTICE("Init emqx plugin kafka successfully.....~n"),
   ok.
@@ -574,6 +577,7 @@ unload() ->
   emqx:unhook('message.acked', {?MODULE, on_message_acked}),
   emqx:unhook('message.dropped', {?MODULE, on_message_dropped}),
   brod:stop_client(emqx_repost_worker),
+  persistent_term:erase({emqx_plugin_kafka, kafka_client_config}),
   erase_config_cache().
 
 %% delivered / acked 默认不转发：一条 MQTT 消息被 N 个订阅者消费时，这两个钩子

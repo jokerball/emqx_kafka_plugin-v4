@@ -60,6 +60,10 @@
         , note_failed/1
         , note_failed/2
         , note_producer_down/0
+        , report_producer_down/1
+        , recovery_state/0
+        , recovery_info/0
+        , rebuild_client/0
         ]).
 
 -export([ init/1
@@ -98,6 +102,34 @@
 -define(BREAKER_MS, breaker_open_ms).
 -define(PRODUCER_DOWN, producer_down).
 
+-define(RECOVERY_DEGRADE, recovery_degrade_count).
+-define(REBUILD_CNT, client_rebuild_count).
+-define(RECOVERY_EXHAUSTED_CNT, recovery_exhausted_count).
+
+%% 必须与 worker 侧的 ?KAFKA_CLIENT 一致
+-define(CLIENT, emqx_repost_worker).
+
+%% client 级兜底恢复：三层健康信号 -> 五状态机 -> 退避重建。
+%% 状态：healthy -> degraded -> rebuilding_client -> verifying -> healthy
+%%       （重建次数在窗口内超限则进入 exhausted，只保留低频探测，靠手动 rebuild 或
+%%         探测成功自动解除）
+-define(DEFAULT_ACK_STALL_MS, 30000).
+%% 熔断持续打开且探测始终失败时，升级为 client 重建。
+%% 这是「produce 快速失败」场景唯一的触发信号：broker/client 立刻返回错误时
+%% inflight 恒为 0，ack 停滞检测永远不会命中，producer 也不会 DOWN，
+%% 只会看到熔断一直开合，正是压测里 27.115 无法自愈的形态。0 表示关闭该升级。
+-define(DEFAULT_BREAKER_ESCALATE_MS, 120000).
+-define(DEFAULT_PRODUCER_DOWN_WINDOW_MS, 60000).
+-define(DEFAULT_PRODUCER_DOWN_THRESHOLD, 3).
+-define(DEFAULT_REBUILD_BACKOFF_BASE_MS, 1000).
+-define(DEFAULT_REBUILD_BACKOFF_MAX_MS, 30000).
+-define(DEFAULT_REBUILD_WINDOW_MS, 3600000).
+-define(DEFAULT_MAX_REBUILDS, 6).
+-define(DEFAULT_VERIFY_MS, 10000).
+-define(DEFAULT_REBUILD_TIMEOUT_MS, 15000).
+%% stop_client 返回后立刻 start_client 可能拿到 already_started，留一点沉降时间
+-define(REBUILD_SETTLE_MS, 200).
+
 -define(DEFAULT_WORKERS, 4).
 -define(DEFAULT_MAX_LEN, 100000).
 -define(DEFAULT_MAX_BYTES, 134217728).  %% 128MB
@@ -120,7 +152,22 @@
                 breaker = closed :: closed | probing | open,
                 open_at = undefined :: integer() | undefined,
                 probe_tref :: reference() | undefined,
-                probe_timeout_tref :: reference() | undefined}).
+                probe_timeout_tref :: reference() | undefined,
+                %% ---- client 级兜底恢复状态机 ----
+                recovery = healthy :: healthy | degraded | rebuilding_client
+                                     | verifying | exhausted,
+                recovery_reason = undefined :: term(),
+                recovery_since = undefined :: integer() | undefined,
+                rebuild_attempt = 0 :: non_neg_integer(),
+                rebuild_times = [] :: [integer()],
+                rebuild_tref :: reference() | undefined,
+                rebuild_timeout_tref :: reference() | undefined,
+                rebuild_epoch = 0 :: non_neg_integer(),
+                verify_tref :: reference() | undefined,
+                %% ack 停滞检测：inflight > 0 且 acked 连续不增长即判定 client 半死
+                last_acked = 0 :: non_neg_integer(),
+                ack_stall_since = undefined :: integer() | undefined,
+                producer_down_times = [] :: [integer()]}).
 
 %%--------------------------------------------------------------------
 %% API
@@ -242,6 +289,10 @@ stats() ->
       breaker_action => breaker_action(),
       breaker_open_count => counter(?BREAKER_CNT),
       breaker_open_ms => counter(?BREAKER_MS),
+      recovery => recovery_state(),
+      recovery_degrade_count => counter(?RECOVERY_DEGRADE),
+      client_rebuild_count => counter(?REBUILD_CNT),
+      recovery_exhausted_count => counter(?RECOVERY_EXHAUSTED_CNT),
       workers => pool_size(),
       max_len => max_len(),
       max_bytes => max_bytes(),
@@ -293,6 +344,30 @@ note_failed(Kind, N) ->
 
 note_producer_down() ->
     incr(?PRODUCER_DOWN).
+
+%% worker 侧 producer 退出时上报。单个 producer 崩掉 brod 会自动重启，只有窗口内
+%% 连续多次才说明 client 层已不可用，因此这里只做计数，由协调进程裁决是否重建。
+-spec report_producer_down(term()) -> ok.
+report_producer_down(Reason) ->
+    catch gen_server:cast(?MODULE, {producer_down, Reason}),
+    ok.
+
+-spec recovery_state() -> healthy | degraded | rebuilding_client | verifying | exhausted | unknown.
+recovery_state() ->
+    maps:get(state, recovery_info(), unknown).
+
+-spec recovery_info() -> map().
+recovery_info() ->
+    try gen_server:call(?MODULE, recovery_info, 2000)
+    catch
+        _:_ -> #{state => unknown}
+    end.
+
+%% 手动重建：绕过退避立即执行，并清空窗口内的重建预算（运维显式介入）
+-spec rebuild_client() -> ok.
+rebuild_client() ->
+    catch gen_server:cast(?MODULE, manual_rebuild),
+    ok.
 
 report_failure(Streak, Reason) ->
     catch gen_server:cast(?MODULE, {produce_failed, self(), Streak, Reason}),
@@ -355,6 +430,25 @@ init([]) ->
                         max(1, env(batch_max_bytes, ?DEFAULT_BATCH_MAX_BYTES))),
     persistent_term:put({?MODULE, breaker_action},
                         normalize_breaker_action(env(breaker_action, ?DEFAULT_BREAKER_ACTION))),
+    persistent_term:put({?MODULE, ack_stall_ms},
+                        max(1, env(ack_stall_ms, ?DEFAULT_ACK_STALL_MS))),
+    persistent_term:put({?MODULE, breaker_escalate_ms},
+                        max(0, env(breaker_escalate_ms, ?DEFAULT_BREAKER_ESCALATE_MS))),
+    persistent_term:put({?MODULE, producer_down_window_ms},
+                        max(1, env(producer_down_window_ms, ?DEFAULT_PRODUCER_DOWN_WINDOW_MS))),
+    persistent_term:put({?MODULE, producer_down_threshold},
+                        max(1, env(producer_down_threshold, ?DEFAULT_PRODUCER_DOWN_THRESHOLD))),
+    persistent_term:put({?MODULE, rebuild_backoff_base_ms},
+                        max(1, env(rebuild_backoff_base_ms, ?DEFAULT_REBUILD_BACKOFF_BASE_MS))),
+    persistent_term:put({?MODULE, rebuild_backoff_max_ms},
+                        max(1, env(rebuild_backoff_max_ms, ?DEFAULT_REBUILD_BACKOFF_MAX_MS))),
+    persistent_term:put({?MODULE, rebuild_window_ms},
+                        max(1, env(rebuild_window_ms, ?DEFAULT_REBUILD_WINDOW_MS))),
+    persistent_term:put({?MODULE, max_rebuilds},
+                        max(1, env(max_rebuilds, ?DEFAULT_MAX_REBUILDS))),
+    persistent_term:put({?MODULE, verify_ms}, max(1, env(verify_ms, ?DEFAULT_VERIFY_MS))),
+    persistent_term:put({?MODULE, rebuild_timeout_ms},
+                        max(1, env(rebuild_timeout_ms, ?DEFAULT_REBUILD_TIMEOUT_MS))),
     ets:insert(?TAB, [{?QUEUE, 0, 0, closed},
                       {?BUFFERED, 0}, {?ACKED, 0}, {?LATE_BUFFERED, 0}, {?FAILED, 0},
                       {?FAILED_TIMEOUT, 0}, {?FAILED_PRODUCER_DOWN, 0},
@@ -362,7 +456,8 @@ init([]) ->
                       {?DROPPED, 0}, {?DROP_LEN, 0}, {?DROP_BYTES, 0},
                       {?DROP_UNAVAIL, 0}, {?DROP_PROBE, 0}, {?DROP_BREAKER, 0},
                       {?BREAKER_CNT, 0}, {?BREAKER_MS, 0},
-                      {?PRODUCER_DOWN, 0}
+                      {?PRODUCER_DOWN, 0}, {?RECOVERY_DEGRADE, 0},
+                      {?REBUILD_CNT, 0}, {?RECOVERY_EXHAUSTED_CNT, 0}
                       | [{{?OUTSTANDING, N}, 0, 0} || N <- tuple_to_list(Names)]]),
     %% 本进程重启会重建 ETS、计数归零，worker 的 pending 却仍占真实内存，
     %% 让它们清空 pending 且不做 release（计数已归零）。
@@ -378,33 +473,64 @@ init([]) ->
                  breaker_action(), batch_max_count(), batch_max_bytes()]),
     {ok, #state{report_interval = Interval}}.
 
+handle_call(recovery_info, _From, State) ->
+    {reply, recovery_snapshot(State), State};
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
-handle_cast({produce_failed, _Worker, Streak, Reason}, State = #state{breaker = closed}) ->
+handle_cast({produce_failed, _Worker, Streak, Reason}, State) ->
     State1 = State#state{last_error = Reason},
-    case Streak >= fail_threshold() of
-        true -> {noreply, open_breaker(Reason, State1)};
-        false -> {noreply, State1}
+    case State#state.recovery of
+        verifying ->
+            %% 重建后的探测仍然失败：说明 client 层没救回来，进入下一轮退避
+            {noreply, verify_failed(Reason, State1)};
+        _ ->
+            handle_produce_failed(Streak, Reason, State1)
     end;
-handle_cast({produce_failed, _Worker, _Streak, Reason}, State = #state{breaker = probing}) ->
-    %% 探测失败立即重新打开，不再等累积到阈值
-    {noreply, open_breaker(Reason, State)};
-handle_cast({produce_failed, _Worker, _Streak, _Reason}, State) ->
-    {noreply, State};
-handle_cast({produce_ok, _Worker}, State = #state{breaker = probing}) ->
-    {noreply, close_breaker(State)};
 handle_cast({produce_ok, _Worker}, State) ->
-    {noreply, State};
+    case State#state.recovery of
+        verifying ->
+            {noreply, verify_ok(State)};
+        exhausted ->
+            %% 放弃态下探测成功说明链路已恢复，自动解除放弃标记
+            {noreply, recover_from_exhausted(State)};
+        _ ->
+            case State#state.breaker of
+                probing -> {noreply, close_breaker(State)};
+                _ -> {noreply, State}
+            end
+    end;
+handle_cast({producer_down, Reason}, State) ->
+    Now = now_ms(),
+    Times = prune_times([Now | State#state.producer_down_times],
+                        Now, producer_down_window_ms()),
+    State1 = State#state{producer_down_times = Times},
+    case length(Times) >= producer_down_threshold() of
+        true ->
+            ?LOG_ERROR("[KAFKA PLUGIN]producer down ~p times within ~pms "
+                       "(threshold ~p), last reason: ~p",
+                       [length(Times), producer_down_window_ms(),
+                        producer_down_threshold(), Reason]),
+            {noreply, enter_degraded({producer_down, Reason}, State1)};
+        false ->
+            {noreply, State1}
+    end;
+handle_cast(manual_rebuild, State) ->
+    {noreply, manual_rebuild_now(State)};
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info(report, State = #state{report_interval = Interval,
-                                   last_dropped = LastDropped,
-                                   last_failed = LastFailed,
-                                   last_error = LastError}) ->
+handle_info(report, State0 = #state{report_interval = Interval,
+                                    last_dropped = LastDropped,
+                                    last_failed = LastFailed,
+                                    last_error = LastError}) ->
     Dropped = counter(?DROPPED),
     Failed = counter(?FAILED),
+    Acked = counter(?ACKED),
+    Inflight = max(0, counter(?BUFFERED) - Acked),
+    State = check_breaker_escalation(
+              check_ack_stall(Acked, Inflight, State0#state.last_acked,
+                              State0#state{last_acked = Acked})),
     case Dropped > LastDropped of
         true ->
             ?LOG_WARNING("[KAFKA PLUGIN]dropped ~p messages in last ~pms "
@@ -453,6 +579,58 @@ handle_info(probe_timeout, State = #state{breaker = probing}) ->
     {noreply, State#state{breaker = open, probe_tref = TRef,
                           probe_timeout_tref = undefined}};
 handle_info(probe_timeout, State) ->
+    {noreply, State};
+handle_info(rebuild, State = #state{recovery = degraded, rebuild_epoch = Epoch}) ->
+    Epoch1 = Epoch + 1,
+    cancel_timer(State#state.rebuild_tref),
+    incr(?REBUILD_CNT),
+    ?LOG_WARNING("[KAFKA PLUGIN]rebuilding kafka client (epoch ~p, attempt ~p, reason ~p)",
+                 [Epoch1, State#state.rebuild_attempt + 1, State#state.recovery_reason]),
+    Self = self(),
+    %% stop_client/start_client 都是同步调用，放到独立进程里执行，
+    %% 避免重建期间协调进程错过 report tick 和探测超时。
+    spawn(fun() -> Self ! {rebuild_done, Epoch1, do_rebuild_client()} end),
+    TRef = erlang:send_after(rebuild_timeout_ms(), self(), {rebuild_timeout, Epoch1}),
+    {noreply, State#state{recovery = rebuilding_client,
+                          rebuild_epoch = Epoch1,
+                          rebuild_tref = undefined,
+                          rebuild_timeout_tref = TRef,
+                          rebuild_attempt = State#state.rebuild_attempt + 1}};
+handle_info(rebuild, State) ->
+    {noreply, State};
+handle_info({rebuild_done, Epoch, Result}, State = #state{rebuild_epoch = Epoch}) ->
+    cancel_timer(State#state.rebuild_timeout_tref),
+    case Result of
+        ok ->
+            {noreply, enter_verifying(State)};
+        {error, Reason} ->
+            ?LOG_ERROR("[KAFKA PLUGIN]client rebuild failed: ~p", [Reason]),
+            {noreply, enter_degraded({rebuild_failed, Reason}, State)}
+    end;
+handle_info({rebuild_done, _StaleEpoch, _Result}, State) ->
+    %% 重建超时后才返回的结果：状态机已经走到下一轮，直接丢弃
+    {noreply, State};
+handle_info({rebuild_timeout, Epoch}, State = #state{rebuild_epoch = Epoch,
+                                                    recovery = rebuilding_client}) ->
+    ?LOG_ERROR("[KAFKA PLUGIN]client rebuild timed out after ~pms",
+               [rebuild_timeout_ms()]),
+    {noreply, enter_degraded(rebuild_timeout,
+                             State#state{rebuild_timeout_tref = undefined})};
+handle_info({rebuild_timeout, _Epoch}, State) ->
+    {noreply, State};
+handle_info(verify_timeout, State = #state{recovery = verifying}) ->
+    cancel_timer(State#state.probe_timeout_tref),
+    case queued() of
+        0 ->
+            %% 队列已空（故障期间消息全被丢弃或业务本就空闲），没有样本可判定。
+            %% 不能因此再排一轮重建，否则空闲节点会一路烧到 exhausted。
+            {noreply, verify_no_traffic(State)};
+        _ ->
+            ?LOG_ERROR("[KAFKA PLUGIN]client verification timed out after ~pms without success",
+                       [verify_ms()]),
+            {noreply, enter_degraded(verify_timeout, State#state{verify_tref = undefined})}
+    end;
+handle_info(verify_timeout, State) ->
     {noreply, State};
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -509,6 +687,286 @@ close_breaker(State = #state{open_at = OpenAt}) ->
     ?LOG_NOTICE("[KAFKA PLUGIN]kafka recovered, breaker closed, draining parked messages"),
     State#state{breaker = closed, probe_tref = undefined, probe_timeout_tref = undefined,
                 open_at = undefined}.
+
+handle_produce_failed(Streak, Reason, State = #state{breaker = closed}) ->
+    case Streak >= fail_threshold() of
+        true -> {noreply, open_breaker(Reason, State)};
+        false -> {noreply, State}
+    end;
+handle_produce_failed(_Streak, Reason, State = #state{breaker = probing}) ->
+    %% 探测失败立即重新打开，不再等累积到阈值
+    {noreply, open_breaker(Reason, State)};
+handle_produce_failed(_Streak, _Reason, State) ->
+    {noreply, State}.
+
+%%--------------------------------------------------------------------
+%% client 级兜底恢复状态机
+%%--------------------------------------------------------------------
+
+%% ack 停滞检测只在熔断关闭时生效：熔断打开说明已经确认 Kafka 不可达，
+%% 此时 inflight 不动是预期行为，不应算作 client 故障。
+check_ack_stall(_Acked, _Inflight, _LastAcked, State = #state{recovery = Recovery})
+  when Recovery =/= healthy ->
+    State;
+check_ack_stall(_Acked, _Inflight, _LastAcked, State = #state{breaker = Breaker})
+  when Breaker =/= closed ->
+    State;
+check_ack_stall(_Acked, Inflight, _LastAcked, State) when Inflight =< 0 ->
+    State#state{ack_stall_since = undefined};
+check_ack_stall(Acked, _Inflight, LastAcked, State) when Acked > LastAcked ->
+    State#state{ack_stall_since = undefined};
+check_ack_stall(_Acked, _Inflight, _LastAcked,
+                State = #state{ack_stall_since = undefined}) ->
+    State#state{ack_stall_since = now_ms()};
+check_ack_stall(_Acked, Inflight, _LastAcked,
+                State = #state{ack_stall_since = Since}) ->
+    Now = now_ms(),
+    case Now - Since >= ack_stall_ms() of
+        true ->
+            ?LOG_ERROR("[KAFKA PLUGIN]ack stalled: inflight ~p, no ack for ~pms",
+                       [Inflight, Now - Since]),
+            enter_degraded({ack_stalled, Inflight},
+                           State#state{ack_stall_since = undefined});
+        false ->
+            State
+    end.
+
+%% 熔断长期开着却一直探测不回来：只有重建 client 能打破这个循环。
+%% 仅 healthy 态升级；已降级/重建中/放弃态各自有既定节奏，不重复介入。
+check_breaker_escalation(State = #state{recovery = Recovery}) when Recovery =/= healthy ->
+    State;
+check_breaker_escalation(State = #state{breaker = closed}) ->
+    State;
+check_breaker_escalation(State = #state{open_at = undefined}) ->
+    State;
+check_breaker_escalation(State = #state{open_at = OpenAt}) ->
+    case breaker_escalate_ms() of
+        0 ->
+            State;
+        Limit ->
+            Now = now_ms(),
+            case Now - OpenAt >= Limit of
+                true ->
+                    ?LOG_ERROR("[KAFKA PLUGIN]breaker open for ~pms without any successful "
+                               "probe, escalate to client rebuild", [Now - OpenAt]),
+                    enter_degraded({breaker_open, Now - OpenAt}, State);
+                false ->
+                    State
+            end
+    end.
+
+%% 进入降级：统一关掉探测、打开熔断、按退避调度一次 client 重建。
+%% exhausted 与「已在重建中」不重复处理；已排好重建时只更新原因，不重排定时器。
+enter_degraded(_Reason, State = #state{recovery = exhausted}) ->
+    State;
+enter_degraded(_Reason, State = #state{recovery = rebuilding_client}) ->
+    State;
+enter_degraded(Reason, State = #state{recovery = degraded, rebuild_tref = TRef})
+  when TRef =/= undefined ->
+    State#state{recovery_reason = Reason};
+enter_degraded(Reason, State) ->
+    schedule_rebuild(Reason, State).
+
+schedule_rebuild(Reason, State) ->
+    cancel_timer(State#state.probe_tref),
+    cancel_timer(State#state.probe_timeout_tref),
+    cancel_timer(State#state.verify_tref),
+    cancel_timer(State#state.rebuild_tref),
+    cancel_timer(State#state.rebuild_timeout_tref),
+    set_breaker(open),
+    incr(?RECOVERY_DEGRADE),
+    Now = now_ms(),
+    Times = prune_times([Now | State#state.rebuild_times], Now, rebuild_window_ms()),
+    case length(Times) > max_rebuilds() of
+        true ->
+            exhausted_state(Reason, Times, State);
+        false ->
+            Delay = rebuild_delay(State#state.rebuild_attempt),
+            TRef = erlang:send_after(Delay, self(), rebuild),
+            ?LOG_ERROR("[KAFKA PLUGIN]client fault detected (~p), rebuild in ~pms "
+                       "(attempt ~p, ~p/~p rebuilds in last ~pms)",
+                       [Reason, Delay, State#state.rebuild_attempt + 1,
+                        length(Times), max_rebuilds(), rebuild_window_ms()]),
+            State#state{recovery = degraded,
+                        recovery_reason = Reason,
+                        recovery_since = Now,
+                        rebuild_times = Times,
+                        rebuild_tref = TRef,
+                        rebuild_timeout_tref = undefined,
+                        verify_tref = undefined,
+                        ack_stall_since = undefined,
+                        producer_down_times = []}
+    end.
+
+exhausted_state(Reason, Times, State) ->
+    cancel_timer(State#state.probe_tref),
+    cancel_timer(State#state.probe_timeout_tref),
+    cancel_timer(State#state.verify_tref),
+    cancel_timer(State#state.rebuild_tref),
+    cancel_timer(State#state.rebuild_timeout_tref),
+    set_breaker(open),
+    incr(?RECOVERY_EXHAUSTED_CNT),
+    %% 保留低频探测：链路若自行恢复，探测成功会自动解除放弃态；
+    %% 否则只能靠 `emqx_ctl kafka rebuild` 手动介入。
+    TRef = erlang:send_after(probe_interval(), self(), probe),
+    ?LOG_ERROR("[KAFKA PLUGIN]client recovery exhausted after ~p rebuilds in ~pms "
+               "(last reason ~p), drop/park continues, manual rebuild required",
+               [length(Times), rebuild_window_ms(), Reason]),
+    State#state{recovery = exhausted,
+                recovery_reason = {exhausted, Reason},
+                recovery_since = now_ms(),
+                rebuild_times = Times,
+                probe_tref = TRef,
+                rebuild_tref = undefined,
+                rebuild_timeout_tref = undefined,
+                verify_tref = undefined,
+                ack_stall_since = undefined}.
+
+%% 重建完成：清空 worker 侧的旧 producer 监控与元数据缓存，用一次探测窗口验证
+enter_verifying(State = #state{rebuild_epoch = Epoch}) ->
+    cancel_timer(State#state.rebuild_tref),
+    cancel_timer(State#state.rebuild_timeout_tref),
+    cancel_timer(State#state.probe_tref),
+    cancel_timer(State#state.probe_timeout_tref),
+    cancel_timer(State#state.verify_tref),
+    catch ets:match_delete(?TAB, {{part_cnt, '_'}, '_'}),
+    broadcast({client_rebuilt, Epoch}),
+    set_breaker(probing),
+    broadcast({probe, probe_per_worker()}),
+    TRef = erlang:send_after(verify_ms(), self(), verify_timeout),
+    ?LOG_NOTICE("[KAFKA PLUGIN]client rebuilt (epoch ~p), verifying with ~p probe msg/worker",
+                [Epoch, probe_per_worker()]),
+    State#state{recovery = verifying,
+                recovery_since = now_ms(),
+                rebuild_tref = undefined,
+                rebuild_timeout_tref = undefined,
+                verify_tref = TRef,
+                probe_tref = undefined,
+                probe_timeout_tref = undefined,
+                ack_stall_since = undefined}.
+
+verify_ok(State) ->
+    cancel_timer(State#state.verify_tref),
+    cancel_timer(State#state.probe_timeout_tref),
+    ?LOG_NOTICE("[KAFKA PLUGIN]client verified after ~p rebuild attempt(s), recovery healthy",
+                [State#state.rebuild_attempt]),
+    mark_healthy(State#state{verify_tref = undefined}).
+
+verify_no_traffic(State) ->
+    ?LOG_NOTICE("[KAFKA PLUGIN]client rebuilt (epoch ~p) with empty queue, nothing to verify, "
+                "mark healthy", [State#state.rebuild_epoch]),
+    mark_healthy(State#state{verify_tref = undefined}).
+
+verify_failed(Reason, State) ->
+    cancel_timer(State#state.verify_tref),
+    cancel_timer(State#state.probe_timeout_tref),
+    ?LOG_ERROR("[KAFKA PLUGIN]client verification failed: ~p", [Reason]),
+    set_breaker(open),
+    enter_degraded({verify_failed, Reason},
+                   State#state{recovery = degraded,
+                               verify_tref = undefined,
+                               rebuild_tref = undefined}).
+
+recover_from_exhausted(State) ->
+    ?LOG_NOTICE("[KAFKA PLUGIN]probe succeeded while exhausted, clear exhausted flag"),
+    mark_healthy(State).
+
+%% 唯一的「恢复健康」收口：关熔断、广播 drain、清空重建预算与所有故障信号
+mark_healthy(State) ->
+    State1 = close_breaker(State),
+    State1#state{recovery = healthy,
+                 recovery_reason = undefined,
+                 recovery_since = undefined,
+                 rebuild_attempt = 0,
+                 rebuild_times = [],
+                 rebuild_tref = undefined,
+                 verify_tref = undefined,
+                 ack_stall_since = undefined,
+                 producer_down_times = []}.
+
+%% 手动重建：不受退避与窗口预算限制，运维显式介入时清空历史重建次数
+manual_rebuild_now(State = #state{recovery = rebuilding_client}) ->
+    ?LOG_WARNING("[KAFKA PLUGIN]manual rebuild ignored, rebuild already in progress"),
+    State;
+manual_rebuild_now(State) ->
+    cancel_timer(State#state.probe_tref),
+    cancel_timer(State#state.probe_timeout_tref),
+    cancel_timer(State#state.verify_tref),
+    cancel_timer(State#state.rebuild_tref),
+    cancel_timer(State#state.rebuild_timeout_tref),
+    set_breaker(open),
+    ?LOG_WARNING("[KAFKA PLUGIN]manual rebuild requested, recovery state reset"),
+    TRef = erlang:send_after(0, self(), rebuild),
+    State#state{recovery = degraded,
+                recovery_reason = manual,
+                recovery_since = now_ms(),
+                rebuild_attempt = 0,
+                rebuild_times = [],
+                rebuild_tref = TRef,
+                rebuild_timeout_tref = undefined,
+                verify_tref = undefined,
+                ack_stall_since = undefined,
+                producer_down_times = []}.
+
+%% 在独立进程里执行，stop 失败（client 本就不在）不应阻断后续 start
+do_rebuild_client() ->
+    catch brod:stop_client(?CLIENT),
+    timer:sleep(?REBUILD_SETTLE_MS),
+    case persistent_term:get({emqx_plugin_kafka, kafka_client_config}, undefined) of
+        {Addresses, Config} when is_list(Addresses), is_list(Config) ->
+            try brod:start_client(Addresses, ?CLIENT, Config) of
+                ok -> ok;
+                {ok, _} -> ok;
+                Other -> {error, Other}
+            catch
+                Class:Reason -> {error, {Class, Reason}}
+            end;
+        Other ->
+            {error, {no_client_config, Other}}
+    end.
+
+recovery_snapshot(State) ->
+    Now = now_ms(),
+    #{state => State#state.recovery,
+      reason => State#state.recovery_reason,
+      since_ms => elapsed(State#state.recovery_since, Now),
+      rebuild_attempt => State#state.rebuild_attempt,
+      rebuild_epoch => State#state.rebuild_epoch,
+      rebuilds_in_window => length(State#state.rebuild_times),
+      max_rebuilds => max_rebuilds(),
+      rebuild_window_ms => rebuild_window_ms(),
+      next_rebuild_in_ms => read_timer_ms(State#state.rebuild_tref),
+      verify_in_ms => read_timer_ms(State#state.verify_tref),
+      ack_stall_elapsed_ms => elapsed(State#state.ack_stall_since, Now),
+      ack_stall_timeout_ms => ack_stall_ms(),
+      breaker_open_ms => elapsed(State#state.open_at, Now),
+      breaker_escalate_ms => breaker_escalate_ms(),
+      last_acked => State#state.last_acked,
+      inflight => inflight(),
+      producer_down_in_window => length(State#state.producer_down_times),
+      producer_down_threshold => producer_down_threshold(),
+      degrade_total => counter(?RECOVERY_DEGRADE),
+      rebuild_total => counter(?REBUILD_CNT),
+      exhausted_total => counter(?RECOVERY_EXHAUSTED_CNT)}.
+
+elapsed(undefined, _Now) -> 0;
+elapsed(Since, Now) -> max(0, Now - Since).
+
+read_timer_ms(undefined) ->
+    0;
+read_timer_ms(TRef) ->
+    case erlang:read_timer(TRef) of
+        false -> 0;
+        Ms -> Ms
+    end.
+
+prune_times(Times, Now, Window) ->
+    [T || T <- Times, Now - T < Window].
+
+rebuild_delay(Attempt) ->
+    Base = rebuild_backoff_base_ms(),
+    Max = rebuild_backoff_max_ms(),
+    min(Max, Base bsl min(Attempt, 10)).
 
 cancel_timer(undefined) ->
     ok;
@@ -595,6 +1053,36 @@ max_bytes() ->
 
 probe_interval() ->
     persistent_term:get({?MODULE, probe_interval}, ?DEFAULT_PROBE_INTERVAL).
+
+ack_stall_ms() ->
+    persistent_term:get({?MODULE, ack_stall_ms}, ?DEFAULT_ACK_STALL_MS).
+
+breaker_escalate_ms() ->
+    persistent_term:get({?MODULE, breaker_escalate_ms}, ?DEFAULT_BREAKER_ESCALATE_MS).
+
+producer_down_window_ms() ->
+    persistent_term:get({?MODULE, producer_down_window_ms}, ?DEFAULT_PRODUCER_DOWN_WINDOW_MS).
+
+producer_down_threshold() ->
+    persistent_term:get({?MODULE, producer_down_threshold}, ?DEFAULT_PRODUCER_DOWN_THRESHOLD).
+
+rebuild_backoff_base_ms() ->
+    persistent_term:get({?MODULE, rebuild_backoff_base_ms}, ?DEFAULT_REBUILD_BACKOFF_BASE_MS).
+
+rebuild_backoff_max_ms() ->
+    persistent_term:get({?MODULE, rebuild_backoff_max_ms}, ?DEFAULT_REBUILD_BACKOFF_MAX_MS).
+
+rebuild_window_ms() ->
+    persistent_term:get({?MODULE, rebuild_window_ms}, ?DEFAULT_REBUILD_WINDOW_MS).
+
+max_rebuilds() ->
+    persistent_term:get({?MODULE, max_rebuilds}, ?DEFAULT_MAX_REBUILDS).
+
+verify_ms() ->
+    persistent_term:get({?MODULE, verify_ms}, ?DEFAULT_VERIFY_MS).
+
+rebuild_timeout_ms() ->
+    persistent_term:get({?MODULE, rebuild_timeout_ms}, ?DEFAULT_REBUILD_TIMEOUT_MS).
 
 pool_size() ->
     max(1, env(queue_workers, ?DEFAULT_WORKERS)).

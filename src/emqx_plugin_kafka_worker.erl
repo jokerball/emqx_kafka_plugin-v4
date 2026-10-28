@@ -85,6 +85,11 @@ handle_cast({probe, N}, State) ->
 handle_cast(drain, State) ->
     %% drain 只在协调进程确认 Kafka 恢复后广播，此时本地失败计数一并清零
     drain(State#state{streak = 0});
+handle_cast({client_rebuilt, _Epoch}, State = #state{producers = Mon}) ->
+    %% 旧 client 名下的 producer 已全部作废：先解除监控并清表，再清零本地失败计数。
+    %% 否则这些 producer 的 DOWN 会被当成新一轮故障上报，刚重建完就再次降级。
+    maps:foreach(fun(_Pid, MRef) -> catch erlang:demonitor(MRef, [flush]) end, Mon),
+    {noreply, State#state{producers = #{}, streak = 0}};
 handle_cast(reset, State) ->
     %% 协调进程重启后计数已归零，清空 pending 但不要 release；
     %% 本地熔断计数也要清零，否则 worker 会一直 park 而等不到 probe。
@@ -363,6 +368,9 @@ handle_producer_down(MRef, Pid, Reason, State = #state{producers = Mon}) ->
             %% 直接按阈值上报，强制熔断：producer 崩溃意味着 buffer 已丢
             emqx_plugin_kafka_queue:report_failure(
               emqx_plugin_kafka_queue:fail_threshold(), {producer_down, Reason}),
+            %% 单次崩溃由 brod 自动重启 producer 即可，只有窗口内反复崩溃才由
+            %% 协调进程判定为 client 层故障并触发重建
+            emqx_plugin_kafka_queue:report_producer_down(Reason),
             ?LOG_ERROR("[KAFKA PLUGIN]producer ~p down: ~p", [Pid, Reason]),
             %% buffer 已随 producer 消失，本地也立即挂起，等恢复广播后再 drain
             {noreply, State#state{producers = Mon1,
