@@ -793,20 +793,30 @@ handle_produce_failed(_Streak, _Reason, State) ->
 
 %% ack 停滞检测只在熔断关闭时生效：熔断打开说明已经确认 Kafka 不可达，
 %% 此时 inflight 不动是预期行为，不应算作 client 故障。
-check_ack_stall(_Acked, _Inflight, _LastAcked, State = #state{recovery = Recovery})
+%% required_acks = 0 时 Kafka 不回确认，acked 恒为 0，停滞检测必然误判，
+%% 必须在入口直接跳过，否则会在 Kafka 完全正常的情况下周期性错误重建 client。
+check_ack_stall(Acked, Inflight, LastAcked, State) ->
+    case required_acks() =:= 0 of
+        true ->
+            State#state{ack_stall_since = undefined};
+        false ->
+            check_ack_stall_1(Acked, Inflight, LastAcked, State)
+    end.
+
+check_ack_stall_1(_Acked, _Inflight, _LastAcked, State = #state{recovery = Recovery})
   when Recovery =/= healthy ->
     State;
-check_ack_stall(_Acked, _Inflight, _LastAcked, State = #state{breaker = Breaker})
+check_ack_stall_1(_Acked, _Inflight, _LastAcked, State = #state{breaker = Breaker})
   when Breaker =/= closed ->
     State;
-check_ack_stall(_Acked, Inflight, _LastAcked, State) when Inflight =< 0 ->
+check_ack_stall_1(_Acked, Inflight, _LastAcked, State) when Inflight =< 0 ->
     State#state{ack_stall_since = undefined};
-check_ack_stall(Acked, _Inflight, LastAcked, State) when Acked > LastAcked ->
+check_ack_stall_1(Acked, _Inflight, LastAcked, State) when Acked > LastAcked ->
     State#state{ack_stall_since = undefined};
-check_ack_stall(_Acked, _Inflight, _LastAcked,
+check_ack_stall_1(_Acked, _Inflight, _LastAcked,
                 State = #state{ack_stall_since = undefined}) ->
     State#state{ack_stall_since = now_ms()};
-check_ack_stall(_Acked, Inflight, _LastAcked,
+check_ack_stall_1(_Acked, Inflight, _LastAcked,
                 State = #state{ack_stall_since = Since}) ->
     Now = now_ms(),
     case Now - Since >= ack_stall_ms() of
