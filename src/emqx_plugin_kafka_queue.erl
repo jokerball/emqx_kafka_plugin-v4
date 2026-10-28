@@ -144,6 +144,9 @@
 -define(REBUILD_SETTLE_MS, 200).
 
 -define(DEFAULT_WORKERS, 4).
+%% queue_workers 设得过大时会为每个 worker 造一个永久原子，可能耗尽原子表
+%% （默认上限约 1M），这里给 pool 大小设上限兜底。
+-define(MAX_POOL_SIZE, 256).
 -define(DEFAULT_MAX_LEN, 100000).
 -define(DEFAULT_MAX_BYTES, 134217728).  %% 128MB
 %% 心跳独立配额默认值：心跳 payload 极小（~150B），按条数封顶更贴近实际占用
@@ -480,6 +483,7 @@ worker_names() ->
 %%--------------------------------------------------------------------
 
 init([]) ->
+    maybe_warn_pool_size(),
     catch ets:delete(?TAB),
     ets:new(?TAB, [named_table, public, set,
                    {read_concurrency, true}, {write_concurrency, true}]),
@@ -734,8 +738,15 @@ code_change(_OldVsn, State, _Extra) ->
 %%--------------------------------------------------------------------
 
 worker(Key) ->
-    Names = persistent_term:get({?MODULE, workers}),
-    element(erlang:phash2(Key, tuple_size(Names)) + 1, Names).
+    case persistent_term:get({?MODULE, workers}, {}) of
+        {} ->
+            %% 队列进程尚未就绪（sup 尚未写入 workers）：返回 undefined，让
+            %% push 侧的 erlang:send/2 抛 badarg 后走 unavailable 归还额度，
+            %% 而不是在这里直接 badarg 崩溃。
+            undefined;
+        Names ->
+            element(erlang:phash2(Key, tuple_size(Names)) + 1, Names)
+    end.
 
 open_breaker(Reason, State) ->
     cancel_timer(State#state.probe_tref),
@@ -1236,7 +1247,18 @@ rebuild_timeout_ms() ->
     persistent_term:get({?MODULE, rebuild_timeout_ms}, ?DEFAULT_REBUILD_TIMEOUT_MS).
 
 pool_size() ->
-    max(1, env(queue_workers, ?DEFAULT_WORKERS)).
+    min(?MAX_POOL_SIZE, max(1, env(queue_workers, ?DEFAULT_WORKERS))).
+
+%% init 时兜底告警：pool_size/0 已 clamp 到 ?MAX_POOL_SIZE，这里把被夹掉的部分
+%% 显式打出来，避免运维配置了超大 worker 数却无声无息地只起 256 个。
+maybe_warn_pool_size() ->
+    case env(queue_workers, ?DEFAULT_WORKERS) of
+        N when N > ?MAX_POOL_SIZE ->
+            ?LOG_WARNING("[KAFKA PLUGIN]queue_workers=~p exceeds max ~p, clamped to ~p",
+                         [N, ?MAX_POOL_SIZE, ?MAX_POOL_SIZE]);
+        _ ->
+            ok
+    end.
 
 required_acks() ->
     try

@@ -59,6 +59,9 @@
 
 -define(BROD_PRODUCE_REQ_BUFFERED, brod_produce_req_buffered).
 
+%% 分区数缓存的失效时间，过期后重新向 brod 查询，避免 Topic 动态扩分区后按旧分区数哈希
+-define(PART_CNT_TTL_MS, 60000).
+
 %% pending 里的元素：{Size, Topic, Key, Payload}，Size 预先算好，批量切分时
 %% 不需要反复 byte_size/1。心跳与业务消息分别存在 hb_pending / pending。
 -record(state, {name :: atom(),
@@ -371,7 +374,7 @@ send_group(Kind, Topic, Partition, Items, Timeout, State = #state{name = Name}) 
             State1 = ensure_monitor(Pid, State),
             Count = length(Items),
             Bytes = items_bytes(Items),
-            case produce_group(Pid, Items, Count, Timeout) of
+            case produce_group(Pid, Items, Timeout) of
                 ok ->
                     %% 一组只归还一次额度，把每条一次的 ETS 更新摊薄到每组一次
                     release_batch(Kind, Count, Bytes, Name),
@@ -396,22 +399,26 @@ release_batch(msg, Count, Bytes, Name) ->
 %% 与 brod_producer:produce_cb/4 等价，区别是：
 %%   * 一组多条消息合成一个 req，只做一次 monitor/send/receive；
 %%   * receive 带超时：buffer 满时 brod 不会回 buffered 回执，超时是唯一感知手段；
-%%   * CallRef 的 ref 里带上组内条数，超时后迟到的回执才能按条数补记 buffered。
-produce_group(Pid, Items, Count, Timeout) ->
+%%   * CallRef 的 ref 里带上实际写入条数，超时后迟到的回执才能按条数补记 buffered。
+produce_group(Pid, Items, Timeout) ->
     Mref = erlang:monitor(process, Pid),
-    CallRef = #brod_call_ref{caller = self(), callee = Pid, ref = {Mref, Count}},
-    %% AckCb 必须是 fun/2：传 undefined 时 acked 回执会被 send 到本进程邮箱
-    AckCb = fun(_Partition, _BaseOffset) -> emqx_plugin_kafka_queue:note_acked(Count) end,
     %% brod 3.16 的批次单元是 map（#{ts, key, value}），一个 req 可携带多条，
     %% 用 brod 自己的构造函数拼接，避免与内部格式耦合。
     Batch = lists:append([brod_utils:make_batch_input(Key, Payload)
                           || {_Size, _Topic, Key, Payload} <- Items]),
+    %% 对账以 brod 侧 msg_cnt（= length(Batch)）为准，而非外层 length(Items)：
+    %% 若某条 payload 是 batch，make_batch_input 会从单条展开成多条，两者不再相等，
+    %% note_buffered/note_acked 必须与 brod 实际口径保持一致。
+    BatchLen = length(Batch),
+    CallRef = #brod_call_ref{caller = self(), callee = Pid, ref = {Mref, BatchLen}},
+    %% AckCb 必须是 fun/2：传 undefined 时 acked 回执会被 send 到本进程邮箱
+    AckCb = fun(_Partition, _BaseOffset) -> emqx_plugin_kafka_queue:note_acked(BatchLen) end,
     Pid ! {produce, CallRef, Batch, AckCb},
     receive
-        #brod_produce_reply{call_ref = #brod_call_ref{ref = {Mref, Count}},
+        #brod_produce_reply{call_ref = #brod_call_ref{ref = {Mref, BatchLen}},
                             result = ?BROD_PRODUCE_REQ_BUFFERED} ->
             erlang:demonitor(Mref, [flush]),
-            emqx_plugin_kafka_queue:note_buffered(Count),
+            emqx_plugin_kafka_queue:note_buffered(BatchLen),
             ok;
         {'DOWN', Mref, process, _, Reason} ->
             {error, {producer_down, Reason}}
@@ -422,19 +429,25 @@ produce_group(Pid, Items, Count, Timeout) ->
 
 partitions_count(Topic) ->
     try ets:lookup(?TAB, {part_cnt, Topic}) of
-        [{_, Cnt}] ->
-            {ok, Cnt};
-        [] ->
-            case brod:get_partitions_count(?KAFKA_CLIENT, Topic) of
-                {ok, Cnt} ->
-                    ets:insert(?TAB, {{part_cnt, Topic}, Cnt}),
-                    {ok, Cnt};
-                {error, Reason} ->
-                    {error, Reason}
-            end
+        [{_, {Cnt, Ts}}] ->
+            case Ts + ?PART_CNT_TTL_MS > now_ms() of
+                true -> {ok, Cnt};
+                false -> refresh_partitions_count(Topic)
+            end;
+        _ ->
+            refresh_partitions_count(Topic)
     catch
         error:badarg ->
             {error, unavailable}
+    end.
+
+refresh_partitions_count(Topic) ->
+    case brod:get_partitions_count(?KAFKA_CLIENT, Topic) of
+        {ok, Cnt} ->
+            ets:insert(?TAB, {{part_cnt, Topic}, {Cnt, now_ms()}}),
+            {ok, Cnt};
+        {error, Reason} ->
+            {error, Reason}
     end.
 
 %% 长期监控 producer：它崩溃时 brod 内部 buffer 会静默消失，必须能被观测到
