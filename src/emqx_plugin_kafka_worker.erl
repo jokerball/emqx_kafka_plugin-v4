@@ -94,9 +94,14 @@ handle_cast({client_rebuilt, _Epoch}, State = #state{producers = Mon}) ->
     %% 否则这些 producer 的 DOWN 会被当成新一轮故障上报，刚重建完就再次降级。
     maps:foreach(fun(_Pid, MRef) -> catch erlang:demonitor(MRef, [flush]) end, Mon),
     {noreply, State#state{producers = #{}, streak = 0}};
-handle_cast(reset, State) ->
-    %% 协调进程重启后计数已归零，清空 pending 但不要 release；
+handle_cast(reset, State = #state{pending_len = L}) ->
+    %% 协调进程重启后计数已归零：pending 里的消息随这次清空永久丢失，补记 failed
+    %% 使其进入 lost 对账，避免静默丢失无法归因。
     %% 本地熔断计数也要清零，否则 worker 会一直 park 而等不到 probe。
+    case L > 0 of
+        true -> emqx_plugin_kafka_queue:note_failed(queue_restart, L);
+        false -> ok
+    end,
     {noreply, State#state{pending = queue:new(), pending_len = 0, pending_bytes = 0,
                           streak = 0}};
 handle_cast(_Msg, State) ->
@@ -408,6 +413,9 @@ reclaim_outstanding(Name) ->
             ets:insert(?TAB, {{outstanding, Name}, 0, 0}),
             case C > 0 of
                 true ->
+                    %% 随 worker 崩溃永久丢失的消息（mailbox + pending 都随进程消失），
+                    %% 补记 failed 使其进入 lost 对账，避免静默丢失无法归因。
+                    emqx_plugin_kafka_queue:note_failed(worker_crash, C),
                     ?LOG_NOTICE("[KAFKA PLUGIN]worker ~p restarted, reclaimed ~p msgs / ~p bytes",
                                 [Name, C, B]);
                 false ->

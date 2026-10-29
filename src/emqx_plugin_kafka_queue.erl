@@ -416,6 +416,7 @@ worker_names() ->
 
 init([]) ->
     maybe_warn_pool_size(),
+    assert_brod_compat(),
     catch ets:delete(?TAB),
     ets:new(?TAB, [named_table, public, set,
                    {read_concurrency, true}, {write_concurrency, true}]),
@@ -423,7 +424,8 @@ init([]) ->
     persistent_term:put({?MODULE, workers}, Names),
     persistent_term:put({?MODULE, max_len}, env(queue_max_len, ?DEFAULT_MAX_LEN)),
     persistent_term:put({?MODULE, max_bytes}, env(queue_max_bytes, ?DEFAULT_MAX_BYTES)),
-    persistent_term:put({?MODULE, produce_timeout}, env(produce_timeout, ?DEFAULT_PRODUCE_TIMEOUT)),
+    persistent_term:put({?MODULE, produce_timeout},
+                        max(1, env(produce_timeout, ?DEFAULT_PRODUCE_TIMEOUT))),
     persistent_term:put({?MODULE, fail_threshold}, env(fail_threshold, ?DEFAULT_FAIL_THRESHOLD)),
     persistent_term:put({?MODULE, probe_interval}, env(probe_interval, ?DEFAULT_PROBE_INTERVAL)),
     persistent_term:put({?MODULE, probe_per_worker},
@@ -1118,6 +1120,25 @@ maybe_warn_pool_size() ->
                          [N, ?MAX_POOL_SIZE, ?MAX_POOL_SIZE]);
         _ ->
             ok
+    end.
+
+%% 启动期版本护栏：worker 绕过 brod 公共 API 直接构造 {produce, CallRef, Batch, AckCb}，
+%% 依赖 brod 3.16.x 的 #brod_call_ref / #brod_produce_reply 字段布局与 produce 回执语义。
+%% 升级 brod 前必须同步核对并更新 worker 里的本地 record 声明，这里在非 3.16 时显式
+%% 报错，把「静默不兼容」变成启动期提示。
+assert_brod_compat() ->
+    Vsn = case application:get_key(brod, vsn) of
+              {ok, V} -> V;
+              undefined -> ""
+          end,
+    case is_list(Vsn) andalso lists:prefix("3.16", Vsn) of
+        true ->
+            ok;
+        false ->
+            ?LOG_ERROR("[KAFKA PLUGIN]brod version ~p is not in the 3.16 line, but worker "
+                       "bypasses the brod public API with hand-copied #brod_call_ref/"
+                       "#brod_produce_reply records; verify the record layouts after "
+                       "upgrading brod", [Vsn])
     end.
 
 required_acks() ->
