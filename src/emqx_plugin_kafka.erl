@@ -125,7 +125,7 @@ on_client_heartbeat(_ClientInfo = #{clientid := ClientId, protocol := Protocol},
     {ts, Now},
     {cluster_node, node()}
   ],
-  produce_kafka_heartbeat(ClientId, Payload),
+  produce_kafka_payload(ClientId, Payload, on_client_heartbeat),
   ok.
 
 on_client_connect(ConnInfo = #{clientid := ClientId}, Props, _Env) ->
@@ -154,7 +154,7 @@ on_client_connected(ClientInfo = #{clientid := ClientId, protocol := Protocol},
     {ts, Now},
     {cluster_node, node()}
   ],
-  produce_kafka_heartbeat(ClientId, Payload),
+  produce_kafka_payload(ClientId, Payload, on_client_heartbeat),
   ok.
 %%  {IpAddr, _Port} = maps:get(peername, ConnInfo),
 %%  Action = <<"connected">>,
@@ -191,7 +191,7 @@ on_client_disconnected(ClientInfo = #{clientid := ClientId, protocol := Protocol
     {off, 1},
     {cluster_node, node()}
   ],
-  produce_kafka_heartbeat(ClientId, Payload),
+  produce_kafka_payload(ClientId, Payload, on_client_heartbeat),
   ok.
 %%  Action = <<"disconnected">>,
 %%  Now = now_mill_secs(),
@@ -620,23 +620,6 @@ produce_kafka_payload(Key, Message, Event) ->
 
 produce_kafka_payload_by_kafka_topic(Key, Message, KafkaTopic) ->
   enqueue_kafka(KafkaTopic, Key, Message).
-
-%% 心跳类事件（heartbeat/connected/disconnected 的上线心跳）走独立通道，
-%% 与业务消息分离，worker 侧优先流转，避免业务积压挤掉心跳。
-produce_kafka_heartbeat(Key, Message) ->
-  enqueue_kafka_hb(get_kafka_topic(on_client_heartbeat), Key, Message).
-
-%% hook 里只做「容量判断 + JSON 编码 + 入队」，绝不直接调用 brod
-enqueue_kafka_hb(Topic, Key, Message) ->
-  case emqx_json:safe_encode(Message) of
-    {ok, MessageBody} ->
-      _ = emqx_plugin_kafka_queue:push_heartbeat(Topic, Key, MessageBody),
-      ok;
-    {error, Reason} ->
-      ?LOG_WARNING("[KAFKA PLUGIN]failed to encode heartbeat for topic ~s: ~p",
-        [Topic, Reason]),
-      ok
-  end.
 
 %% hook 里只做「容量判断 + JSON 编码 + 入队」，绝不直接调用 brod
 enqueue_kafka(Topic, Key, Message) ->

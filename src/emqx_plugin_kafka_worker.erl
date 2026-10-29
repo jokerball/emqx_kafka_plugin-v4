@@ -17,8 +17,6 @@
 %% @doc Kafka 写入 worker。
 %%
 %% 每个 worker 只负责自己分片（按 device_id 哈希）的消息，串行写 Kafka。
-%% 心跳与业务消息走两条独立 FIFO（hb_pending / pending），drain 永远先清空
-%% 心跳队列再处理业务消息，保证业务积压不会拖慢心跳流转。
 %%
 %% 消息先进本地 FIFO，再从邮箱里尽量多捞一批，按 {Topic, Partition}
 %% 分组后每组只做一次 monitor/send/receive，把「每条一次」的调度开销摊薄到
@@ -46,9 +44,8 @@
 
 -define(TAB, emqx_plugin_kafka_queue_tab).
 -define(KAFKA_CLIENT, emqx_repost_worker).
-%% 必须与 emqx_plugin_kafka_queue.erl 的 ?QUEUE / ?HB_QUEUE 保持一致
+%% 必须与 emqx_plugin_kafka_queue.erl 的 ?QUEUE 保持一致
 -define(QUEUE, queue_usage).
--define(HB_QUEUE, hb_queue_usage).
 
 %% brod 3.16.8 的 #brod_call_ref{} / #brod_produce_reply{} 以及
 %% brod_producer:produce_cb/4 往 producer 进程发的 {produce, CallRef, Batch, AckCb}
@@ -63,15 +60,12 @@
 -define(PART_CNT_TTL_MS, 60000).
 
 %% pending 里的元素：{Size, Topic, Key, Payload}，Size 预先算好，批量切分时
-%% 不需要反复 byte_size/1。心跳与业务消息分别存在 hb_pending / pending。
+%% 不需要反复 byte_size/1。
 -record(state, {name :: atom(),
                 streak = 0 :: non_neg_integer(),
                 pending = queue:new() :: queue:queue(),
                 pending_len = 0 :: non_neg_integer(),
                 pending_bytes = 0 :: non_neg_integer(),
-                hb_pending = queue:new() :: queue:queue(),
-                hb_pending_len = 0 :: non_neg_integer(),
-                hb_pending_bytes = 0 :: non_neg_integer(),
                 producers = #{} :: #{pid() => reference()}}).
 
 start_link(Name) ->
@@ -80,7 +74,6 @@ start_link(Name) ->
 init(Name) ->
     set_message_queue_data(),
     reclaim_outstanding(Name),
-    reclaim_outstanding_hb(Name),
     {ok, #state{name = Name}}.
 
 handle_call(_Request, _From, State) ->
@@ -91,9 +84,6 @@ handle_cast({produce, Topic, Key, Payload}, State) ->
     %% 熔断状态通过 ETS 传播有延迟，Kafka 快速失败时 worker 可能把整个邮箱
     %% 逐条烧完。drain 里用本地连续失败数做同阈值的前置熔断。
     drain(collect(park_msg(Item, State)));
-handle_cast({produce_heartbeat, Topic, Key, Payload}, State) ->
-    Item = {byte_size(Payload), Topic, Key, Payload},
-    drain(collect(park_hb(Item, State)));
 handle_cast({probe, N}, State) ->
     probe(N, State);
 handle_cast(drain, State) ->
@@ -108,8 +98,7 @@ handle_cast(reset, State) ->
     %% 协调进程重启后计数已归零，清空 pending 但不要 release；
     %% 本地熔断计数也要清零，否则 worker 会一直 park 而等不到 probe。
     {noreply, State#state{pending = queue:new(), pending_len = 0, pending_bytes = 0,
-                          hb_pending = queue:new(), hb_pending_len = 0,
-                          hb_pending_bytes = 0, streak = 0}};
+                          streak = 0}};
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
@@ -154,10 +143,7 @@ collect(State, N, Bytes) ->
     receive
         {'$gen_cast', {produce, Topic, Key, Payload}} ->
             Size = byte_size(Payload),
-            collect(park_msg({Size, Topic, Key, Payload}, State), N - 1, Bytes - Size);
-        {'$gen_cast', {produce_heartbeat, Topic, Key, Payload}} ->
-            Size = byte_size(Payload),
-            collect(park_hb({Size, Topic, Key, Payload}, State), N - 1, Bytes - Size)
+            collect(park_msg({Size, Topic, Key, Payload}, State), N - 1, Bytes - Size)
     after 0 ->
         State
     end.
@@ -166,16 +152,9 @@ park_msg(Item, State = #state{pending = Q, pending_len = L, pending_bytes = B}) 
     {Size, _, _, _} = Item,
     State#state{pending = queue:in(Item, Q), pending_len = L + 1, pending_bytes = B + Size}.
 
-park_hb(Item, State = #state{hb_pending = Q, hb_pending_len = L, hb_pending_bytes = B}) ->
-    {Size, _, _, _} = Item,
-    State#state{hb_pending = queue:in(Item, Q), hb_pending_len = L + 1, hb_pending_bytes = B + Size}.
-
 %% 放回队首：未发送的消息不能排到新消息后面，否则同一分片的顺序会被打乱
-park_front(Kind, Items, State) ->
-    case Kind of
-        hb  -> park_hb_front(Items, State);
-        msg -> park_msg_front(Items, State)
-    end.
+park_front(Items, State) ->
+    park_msg_front(Items, State).
 
 park_msg_front([], State) ->
     State;
@@ -186,48 +165,25 @@ park_msg_front(Items, State = #state{pending = Q, pending_len = L, pending_bytes
                     end, {Q, L, B}, lists:reverse(Items)),
     State#state{pending = Q1, pending_len = L1, pending_bytes = B1}.
 
-park_hb_front([], State) ->
-    State;
-park_hb_front(Items, State = #state{hb_pending = Q, hb_pending_len = L,
-                                     hb_pending_bytes = B}) ->
-    {Q1, L1, B1} =
-        lists:foldl(fun({Size, _, _, _} = Item, {Qa, La, Ba}) ->
-                            {queue:in_r(Item, Qa), La + 1, Ba + Size}
-                    end, {Q, L, B}, lists:reverse(Items)),
-    State#state{hb_pending = Q1, hb_pending_len = L1, hb_pending_bytes = B1}.
-
-drain(State = #state{hb_pending_len = 0, pending_len = 0}) ->
+drain(State = #state{pending_len = 0}) ->
     {noreply, State};
 drain(State = #state{streak = Streak}) ->
     case can_send(Streak) of
         false ->
             {noreply, State};
         true ->
-            drain_priority(State)
-    end.
-
-%% 心跳优先：只要 hb FIFO 非空就先发心跳，心跳清空后才轮到业务消息
-drain_priority(State = #state{hb_pending_len = H}) when H > 0 ->
-    maybe_continue(drain_hb(State));
-drain_priority(State) ->
-    maybe_continue(drain_msg(State)).
-
-drain_hb(State) ->
-    {Batch, State1} = take_hb_batch(State),
-    case Batch of
-        [] -> State1;
-        _  -> send_batch(hb, Batch, State1)
+            maybe_continue(drain_msg(State))
     end.
 
 drain_msg(State) ->
     {Batch, State1} = take_batch(State),
     case Batch of
         [] -> State1;
-        _  -> send_batch(msg, Batch, State1)
+        _  -> send_batch(Batch, State1)
     end.
 
 maybe_continue(State = #state{streak = Streak}) ->
-    HasWork = State#state.hb_pending_len > 0 orelse State#state.pending_len > 0,
+    HasWork = State#state.pending_len > 0,
     case HasWork andalso can_send(Streak) of
         true ->
             %% 让出进程：既避免单次 drain 长时间占住调度器，也给
@@ -242,21 +198,17 @@ can_send(Streak) ->
     Streak < emqx_plugin_kafka_queue:fail_threshold()
         andalso emqx_plugin_kafka_queue:breaker_state() =:= closed.
 
-probe(_N, State = #state{hb_pending_len = 0, pending_len = 0}) ->
+probe(_N, State = #state{pending_len = 0}) ->
     {noreply, State};
-probe(N, State = #state{hb_pending_len = HLen}) when HLen > 0 ->
-    {Batch, State1} = take_hb_batch(State, max(1, N),
-                                    emqx_plugin_kafka_queue:batch_max_bytes()),
-    probe_result(hb, Batch, State1);
 probe(N, State) ->
     {Batch, State1} = take_batch(State, max(1, N),
                                  emqx_plugin_kafka_queue:batch_max_bytes()),
-    probe_result(msg, Batch, State1).
+    probe_result(Batch, State1).
 
-probe_result(_Kind, [], State) ->
+probe_result([], State) ->
     {noreply, State};
-probe_result(Kind, Batch, State) ->
-    State1 = send_batch(Kind, Batch, State),
+probe_result(Batch, State) ->
+    State1 = send_batch(Batch, State),
     case emqx_plugin_kafka_queue:breaker_state() of
         closed -> drain(State1);       %% 已恢复，剩余积压交给 drain
         _ -> {noreply, State1}
@@ -283,39 +235,16 @@ take_batch(State = #state{pending = Q, pending_len = L, pending_bytes = B}, N, B
                        N - 1, Bytes - Size, [Item | Acc])
     end.
 
-take_hb_batch(State) ->
-    take_hb_batch(State, emqx_plugin_kafka_queue:batch_max_count(),
-                  emqx_plugin_kafka_queue:batch_max_bytes()).
-
-take_hb_batch(State, N, Bytes) ->
-    take_hb_batch(State, N, Bytes, []).
-
-take_hb_batch(State, N, _Bytes, Acc) when N =< 0 ->
-    {lists:reverse(Acc), State};
-take_hb_batch(State, _N, Bytes, Acc) when Bytes =< 0 ->
-    {lists:reverse(Acc), State};
-take_hb_batch(State = #state{hb_pending = Q, hb_pending_len = L, hb_pending_bytes = B},
-              N, Bytes, Acc) ->
-    case queue:out(Q) of
-        {empty, _} ->
-            {lists:reverse(Acc),
-             State#state{hb_pending = Q, hb_pending_len = 0, hb_pending_bytes = 0}};
-        {{value, {Size, _, _, _} = Item}, Q1} ->
-            take_hb_batch(State#state{hb_pending = Q1, hb_pending_len = L - 1,
-                                      hb_pending_bytes = B - Size},
-                          N - 1, Bytes - Size, [Item | Acc])
-    end.
-
 %% 一批消息共用一个超时预算：批内任何一组超时都不会把整批的等待放大成
 %% 组数 × produce_timeout。
-send_batch(Kind, Batch, State) ->
+send_batch(Batch, State) ->
     Deadline = now_ms() + emqx_plugin_kafka_queue:produce_timeout(),
     case group_batch(Batch) of
         {ok, Groups} ->
-            send_groups(Kind, Groups, Deadline, State);
+            send_groups(Groups, Deadline, State);
         {error, Reason} ->
             %% 分区数都拉不到，整批一条都没发出去：放回队首等下一轮，额度不归还
-            on_failure(Reason, length(Batch), park_front(Kind, Batch, State))
+            on_failure(Reason, length(Batch), park_front(Batch, State))
     end.
 
 group_batch(Batch) ->
@@ -346,29 +275,29 @@ group_items([{_Size, Topic, Key, _Payload} = Item | Rest], Counts, Order, Map) -
             group_items(Rest, Counts, [GroupKey | Order], Map#{GroupKey => [Item]})
     end.
 
-send_groups(_Kind, [], _Deadline, State) ->
+send_groups([], _Deadline, State) ->
     State;
-send_groups(Kind, [{GroupKey, Items} | Rest], Deadline, State) ->
+send_groups([{GroupKey, Items} | Rest], Deadline, State) ->
     case remaining(Deadline) of
         0 ->
             %% 批级预算已耗尽：剩下的消息还没发出去，按序放回队首，不丢
-            park_front(Kind, flatten(Rest), State);
+            park_front(flatten(Rest), State);
         Timeout ->
             {Topic, Partition} = GroupKey,
-            case send_group(Kind, Topic, Partition, Items, Timeout, State) of
+            case send_group(Topic, Partition, Items, Timeout, State) of
                 {ok, State1} ->
-                    send_groups(Kind, Rest, Deadline, State1);
+                    send_groups(Rest, Deadline, State1);
                 {unsent, Reason, State1} ->
                     %% 这一组根本没发出去（拿不到 producer），和剩余组一起放回队首
                     on_failure(Reason, length(Items),
-                               park_front(Kind, Items ++ flatten(Rest), State1));
+                               park_front(Items ++ flatten(Rest), State1));
                 {failed, Reason, State1} ->
                     on_failure(Reason, length(Items),
-                               park_front(Kind, flatten(Rest), State1))
+                               park_front(flatten(Rest), State1))
             end
     end.
 
-send_group(Kind, Topic, Partition, Items, Timeout, State = #state{name = Name}) ->
+send_group(Topic, Partition, Items, Timeout, State = #state{name = Name}) ->
     case brod:get_producer(?KAFKA_CLIENT, Topic, Partition) of
         {ok, Pid} ->
             State1 = ensure_monitor(Pid, State),
@@ -377,12 +306,12 @@ send_group(Kind, Topic, Partition, Items, Timeout, State = #state{name = Name}) 
             case produce_group(Pid, Items, Timeout) of
                 ok ->
                     %% 一组只归还一次额度，把每条一次的 ETS 更新摊薄到每组一次
-                    release_batch(Kind, Count, Bytes, Name),
+                    emqx_plugin_kafka_queue:release_batch(Count, Bytes, Name),
                     {ok, on_success(State1)};
                 {error, Reason} ->
                     %% 已经交给 brod 但没拿到 buffered 回执：按丢弃处理，不重试，
                     %% 否则回执迟到时会造成重复写入。
-                    release_batch(Kind, Count, Bytes, Name),
+                    emqx_plugin_kafka_queue:release_batch(Count, Bytes, Name),
                     {failed, Reason, State1}
             end;
         {error, Reason} ->
@@ -390,11 +319,6 @@ send_group(Kind, Topic, Partition, Items, Timeout, State = #state{name = Name}) 
             catch ets:delete(?TAB, {part_cnt, Topic}),
             {unsent, {get_producer, Reason}, State}
     end.
-
-release_batch(hb, Count, Bytes, Name) ->
-    emqx_plugin_kafka_queue:release_hb_batch(Count, Bytes, Name);
-release_batch(msg, Count, Bytes, Name) ->
-    emqx_plugin_kafka_queue:release_batch(Count, Bytes, Name).
 
 %% 与 brod_producer:produce_cb/4 等价，区别是：
 %%   * 一组多条消息合成一个 req，只做一次 monitor/send/receive；
@@ -485,24 +409,6 @@ reclaim_outstanding(Name) ->
             case C > 0 of
                 true ->
                     ?LOG_NOTICE("[KAFKA PLUGIN]worker ~p restarted, reclaimed ~p msgs / ~p bytes",
-                                [Name, C, B]);
-                false ->
-                    ok
-            end;
-        [] ->
-            ok
-    catch
-        error:badarg -> ok
-    end.
-
-reclaim_outstanding_hb(Name) ->
-    try ets:lookup(?TAB, {hb_outstanding, Name}) of
-        [{_, C, B}] ->
-            catch ets:update_counter(?TAB, ?HB_QUEUE, [{2, -C, 0, 0}, {3, -B, 0, 0}]),
-            ets:insert(?TAB, {{hb_outstanding, Name}, 0, 0}),
-            case C > 0 of
-                true ->
-                    ?LOG_NOTICE("[KAFKA PLUGIN]worker ~p restarted, reclaimed ~p hb msgs / ~p hb bytes",
                                 [Name, C, B]);
                 false ->
                     ok

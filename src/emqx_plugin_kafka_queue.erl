@@ -35,7 +35,6 @@
 
 -export([ start_link/0
         , push/3
-        , push_heartbeat/3
         , full_reason/0
         , full/0
         , drop/1
@@ -43,8 +42,6 @@
         , accepting/0
         , release/2
         , release_batch/3
-        , release_hb/2
-        , release_hb_batch/3
         , breaker_state/0
         , breaker_action/0
         , produce_timeout/0
@@ -105,16 +102,6 @@
 -define(BREAKER_MS, breaker_open_ms).
 -define(PRODUCER_DOWN, producer_down).
 
-%% 心跳独立通道：心跳与业务消息各用各的容量计数，业务积压不会吃掉心跳配额。
-%% 心跳配额只受 hb_queue_max_len / hb_queue_max_bytes 约束，不经过熔断准入，
-%% 熔断期间心跳照常入队 park，链路恢复后由 worker 优先补发。
--define(HB_QUEUE, hb_queue_usage).
--define(HB_OUTSTANDING, hb_outstanding).
--define(HB_DROPPED, hb_dropped_total).
--define(DROP_HB_LEN, hb_dropped_full_len).
--define(DROP_HB_BYTES, hb_dropped_full_bytes).
--define(DROP_HB_UNAVAIL, hb_dropped_unavailable).
-
 -define(RECOVERY_DEGRADE, recovery_degrade_count).
 -define(REBUILD_CNT, client_rebuild_count).
 -define(RECOVERY_EXHAUSTED_CNT, recovery_exhausted_count).
@@ -149,9 +136,6 @@
 -define(MAX_POOL_SIZE, 256).
 -define(DEFAULT_MAX_LEN, 100000).
 -define(DEFAULT_MAX_BYTES, 134217728).  %% 128MB
-%% 心跳独立配额默认值：心跳 payload 极小（~150B），按条数封顶更贴近实际占用
--define(DEFAULT_HB_MAX_LEN, 100000).
--define(DEFAULT_HB_MAX_BYTES, 67108864).  %% 64MB
 -define(DEFAULT_REPORT_INTERVAL, 5000).
 -define(DEFAULT_PRODUCE_TIMEOUT, 2000).
 -define(DEFAULT_FAIL_THRESHOLD, 3).
@@ -166,7 +150,6 @@
 
 -record(state, {report_interval = ?DEFAULT_REPORT_INTERVAL :: pos_integer(),
                 last_dropped = 0 :: non_neg_integer(),
-                last_hb_dropped = 0 :: non_neg_integer(),
                 last_failed = 0 :: non_neg_integer(),
                 last_error = undefined :: term(),
                 breaker = closed :: closed | probing | open,
@@ -216,27 +199,6 @@ push(Topic, Key, Payload) ->
             end;
         {drop, Reason} ->
             drop(Reason),
-            {error, Reason}
-    end.
-
-%% @doc 心跳入队：走独立的 hb 配额，不经过业务队列也不经过熔断准入。
-%% 业务消息打满自有队列时不会挤占心跳，熔断打开时心跳照常入队等待恢复补发。
--spec push_heartbeat(binary(), binary(), binary()) -> ok | {error, term()}.
-push_heartbeat(Topic, Key, Payload) ->
-    Size = byte_size(Payload),
-    Worker = worker(Key),
-    case reserve_hb(Size, Worker) of
-        ok ->
-            try erlang:send(Worker, {'$gen_cast', {produce_heartbeat, Topic, Key, Payload}}) of
-                _ -> ok
-            catch
-                _:_ ->
-                    release_hb(Size, Worker),
-                    drop_hb(hb_unavailable),
-                    {error, unavailable}
-            end;
-        {drop, Reason} ->
-            drop_hb(Reason),
             {error, Reason}
     end.
 
@@ -291,13 +253,6 @@ drop(Reason) ->
     incr(drop_counter(Reason)),
     ok.
 
-%% 心跳丢弃走独立计数器，不混入业务消息的 dropped 口径，方便单独观测心跳丢包
--spec drop_hb(hb_full_len | hb_full_bytes | hb_unavailable | term()) -> ok.
-drop_hb(Reason) ->
-    incr(?HB_DROPPED),
-    incr(drop_hb_counter(Reason)),
-    ok.
-
 -spec stats() -> map().
 stats() ->
     {Queued, QueuedBytes} =
@@ -307,7 +262,6 @@ stats() ->
         catch
             error:badarg -> {0, 0}
         end,
-    {HbQueued, HbQueuedBytes} = hb_usage(),
     Buffered = counter(?BUFFERED),
     Acked = counter(?ACKED),
     Failed = counter(?FAILED),
@@ -315,13 +269,6 @@ stats() ->
     #{queued => Queued,
       queued_bytes => QueuedBytes,
       avg_payload_bytes => QueuedBytes div max(1, Queued),
-      hb_queued => HbQueued,
-      hb_queued_bytes => HbQueuedBytes,
-      hb_avg_payload_bytes => HbQueuedBytes div max(1, HbQueued),
-      hb_dropped => counter(?HB_DROPPED),
-      hb_dropped_full_len => counter(?DROP_HB_LEN),
-      hb_dropped_full_bytes => counter(?DROP_HB_BYTES),
-      hb_dropped_unavailable => counter(?DROP_HB_UNAVAIL),
       buffered => Buffered,
       acked => Acked,
       late_buffered => LateBuffered,
@@ -352,8 +299,6 @@ stats() ->
       workers => pool_size(),
       max_len => max_len(),
       max_bytes => max_bytes(),
-      hb_max_len => hb_max_len(),
-      hb_max_bytes => hb_max_bytes(),
       batch_max_count => batch_max_count(),
       batch_max_bytes => batch_max_bytes(),
       required_acks => required_acks()}.
@@ -375,19 +320,6 @@ release_batch(Count, Bytes, Worker) when Count > 0 ->
     catch ets:update_counter(?TAB, {?OUTSTANDING, Worker}, [{2, -Count, 0, 0}, {3, -Bytes, 0, 0}]),
     ok;
 release_batch(_Count, _Bytes, _Worker) ->
-    ok.
-
-%% 心跳额度归还与业务消息分开，两者互不影响
--spec release_hb(non_neg_integer(), atom()) -> ok.
-release_hb(Size, Worker) ->
-    release_hb_batch(1, Size, Worker).
-
--spec release_hb_batch(non_neg_integer(), non_neg_integer(), atom()) -> ok.
-release_hb_batch(Count, Bytes, Worker) when Count > 0 ->
-    catch ets:update_counter(?TAB, ?HB_QUEUE, [{2, -Count, 0, 0}, {3, -Bytes, 0, 0}]),
-    catch ets:update_counter(?TAB, {?HB_OUTSTANDING, Worker}, [{2, -Count, 0, 0}, {3, -Bytes, 0, 0}]),
-    ok;
-release_hb_batch(_Count, _Bytes, _Worker) ->
     ok.
 
 note_buffered() ->
@@ -491,8 +423,6 @@ init([]) ->
     persistent_term:put({?MODULE, workers}, Names),
     persistent_term:put({?MODULE, max_len}, env(queue_max_len, ?DEFAULT_MAX_LEN)),
     persistent_term:put({?MODULE, max_bytes}, env(queue_max_bytes, ?DEFAULT_MAX_BYTES)),
-    persistent_term:put({?MODULE, hb_max_len}, env(hb_queue_max_len, ?DEFAULT_HB_MAX_LEN)),
-    persistent_term:put({?MODULE, hb_max_bytes}, env(hb_queue_max_bytes, ?DEFAULT_HB_MAX_BYTES)),
     persistent_term:put({?MODULE, produce_timeout}, env(produce_timeout, ?DEFAULT_PRODUCE_TIMEOUT)),
     persistent_term:put({?MODULE, fail_threshold}, env(fail_threshold, ?DEFAULT_FAIL_THRESHOLD)),
     persistent_term:put({?MODULE, probe_interval}, env(probe_interval, ?DEFAULT_PROBE_INTERVAL)),
@@ -524,19 +454,15 @@ init([]) ->
     persistent_term:put({?MODULE, rebuild_timeout_ms},
                         max(1, env(rebuild_timeout_ms, ?DEFAULT_REBUILD_TIMEOUT_MS))),
     ets:insert(?TAB, [{?QUEUE, 0, 0, closed},
-                      {?HB_QUEUE, 0, 0},
                       {?BUFFERED, 0}, {?ACKED, 0}, {?LATE_BUFFERED, 0}, {?FAILED, 0},
                       {?FAILED_TIMEOUT, 0}, {?FAILED_PRODUCER_DOWN, 0},
                       {?FAILED_GET_PRODUCER, 0}, {?FAILED_OTHER, 0},
                       {?DROPPED, 0}, {?DROP_LEN, 0}, {?DROP_BYTES, 0},
                       {?DROP_UNAVAIL, 0}, {?DROP_PROBE, 0}, {?DROP_BREAKER, 0},
-                      {?HB_DROPPED, 0}, {?DROP_HB_LEN, 0}, {?DROP_HB_BYTES, 0},
-                      {?DROP_HB_UNAVAIL, 0},
                       {?BREAKER_CNT, 0}, {?BREAKER_MS, 0},
                       {?PRODUCER_DOWN, 0}, {?RECOVERY_DEGRADE, 0},
                       {?REBUILD_CNT, 0}, {?RECOVERY_EXHAUSTED_CNT, 0}
-                      | [{{?OUTSTANDING, N}, 0, 0} || N <- tuple_to_list(Names)]
-                     ++ [{{?HB_OUTSTANDING, N}, 0, 0} || N <- tuple_to_list(Names)]]),
+                      | [{{?OUTSTANDING, N}, 0, 0} || N <- tuple_to_list(Names)]]),
     %% 本进程重启会重建 ETS、计数归零，worker 的 pending 却仍占真实内存，
     %% 让它们清空 pending 且不做 release（计数已归零）。
     broadcast(reset),
@@ -600,11 +526,9 @@ handle_cast(_Msg, State) ->
 
 handle_info(report, State0 = #state{report_interval = Interval,
                                     last_dropped = LastDropped,
-                                    last_hb_dropped = LastHbDropped,
                                     last_failed = LastFailed,
                                     last_error = LastError}) ->
     Dropped = counter(?DROPPED),
-    HbDropped = counter(?HB_DROPPED),
     Failed = counter(?FAILED),
     Acked = counter(?ACKED),
     Inflight = max(0, counter(?BUFFERED) - Acked),
@@ -625,17 +549,6 @@ handle_info(report, State0 = #state{report_interval = Interval,
         false ->
             ok
     end,
-    case HbDropped > LastHbDropped of
-        true ->
-            ?LOG_WARNING("[KAFKA PLUGIN]dropped ~p heartbeats in last ~pms "
-                         "(total ~p: hb_full_len ~p, hb_full_bytes ~p, "
-                         "hb_unavailable ~p), still queued ~p hb msgs / ~p bytes",
-                         [HbDropped - LastHbDropped, Interval, HbDropped,
-                          counter(?DROP_HB_LEN), counter(?DROP_HB_BYTES),
-                          counter(?DROP_HB_UNAVAIL), hb_queued(), hb_queued_bytes()]);
-        false ->
-            ok
-    end,
     case Failed > LastFailed of
         true ->
             ?LOG_WARNING("[KAFKA PLUGIN]produce to kafka failed ~p times in last ~pms "
@@ -648,7 +561,7 @@ handle_info(report, State0 = #state{report_interval = Interval,
             ok
     end,
     erlang:send_after(Interval, self(), report),
-    {noreply, State#state{last_dropped = Dropped, last_hb_dropped = HbDropped,
+    {noreply, State#state{last_dropped = Dropped,
                           last_failed = Failed}};
 handle_info(probe, State = #state{breaker = open}) ->
     set_breaker(probing),
@@ -1109,22 +1022,6 @@ reserve(Size, Worker) ->
         error:badarg -> {drop, unavailable}
     end.
 
-%% 心跳准入：只看 hb 配额，不看业务队列也不看熔断
-reserve_hb(Size, Worker) ->
-    try
-        [N, B] = ets:update_counter(?TAB, ?HB_QUEUE, [{2, 1}, {3, Size}]),
-        case N =< hb_max_len() andalso B =< hb_max_bytes() of
-            true ->
-                catch ets:update_counter(?TAB, {?HB_OUTSTANDING, Worker}, [{2, 1}, {3, Size}]),
-                ok;
-            false ->
-                ets:update_counter(?TAB, ?HB_QUEUE, [{2, -1}, {3, -Size}]),
-                {drop, hb_drop_reason(N, B)}
-        end
-    catch
-        error:badarg -> {drop, hb_unavailable}
-    end.
-
 drop_reason(N, B) ->
     MaxLen = max_len(),
     MaxBytes = max_bytes(),
@@ -1134,24 +1031,11 @@ drop_reason(N, B) ->
         true         -> full_bytes
     end.
 
-hb_drop_reason(N, B) ->
-    MaxLen = hb_max_len(),
-    MaxBytes = hb_max_bytes(),
-    if
-        N > MaxLen   -> hb_full_len;
-        B > MaxBytes -> hb_full_bytes;
-        true         -> hb_full_bytes
-    end.
-
 drop_counter(full_len)   -> ?DROP_LEN;
 drop_counter(full_bytes) -> ?DROP_BYTES;
 drop_counter(probe)      -> ?DROP_PROBE;
 drop_counter(breaker_open) -> ?DROP_BREAKER;
 drop_counter(_)          -> ?DROP_UNAVAIL.
-
-drop_hb_counter(hb_full_len)   -> ?DROP_HB_LEN;
-drop_hb_counter(hb_full_bytes) -> ?DROP_HB_BYTES;
-drop_hb_counter(_)             -> ?DROP_HB_UNAVAIL.
 
 failed_counter(timeout)       -> ?FAILED_TIMEOUT;
 failed_counter(producer_down) -> ?FAILED_PRODUCER_DOWN;
@@ -1165,24 +1049,6 @@ queued() ->
 
 queued_bytes() ->
     try ets:lookup_element(?TAB, ?QUEUE, 3)
-    catch error:badarg -> 0
-    end.
-
-hb_usage() ->
-    try ets:lookup(?TAB, ?HB_QUEUE) of
-        [{?HB_QUEUE, N, B}] -> {N, B};
-        [] -> {0, 0}
-    catch
-        error:badarg -> {0, 0}
-    end.
-
-hb_queued() ->
-    try ets:lookup_element(?TAB, ?HB_QUEUE, 2)
-    catch error:badarg -> 0
-    end.
-
-hb_queued_bytes() ->
-    try ets:lookup_element(?TAB, ?HB_QUEUE, 3)
     catch error:badarg -> 0
     end.
 
@@ -1206,12 +1072,6 @@ max_len() ->
 
 max_bytes() ->
     persistent_term:get({?MODULE, max_bytes}, ?DEFAULT_MAX_BYTES).
-
-hb_max_len() ->
-    persistent_term:get({?MODULE, hb_max_len}, ?DEFAULT_HB_MAX_LEN).
-
-hb_max_bytes() ->
-    persistent_term:get({?MODULE, hb_max_bytes}, ?DEFAULT_HB_MAX_BYTES).
 
 probe_interval() ->
     persistent_term:get({?MODULE, probe_interval}, ?DEFAULT_PROBE_INTERVAL).
