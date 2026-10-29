@@ -203,8 +203,27 @@ can_send(Streak) ->
     Streak < emqx_plugin_kafka_queue:fail_threshold()
         andalso emqx_plugin_kafka_queue:breaker_state() =:= closed.
 
-probe(_N, State = #state{pending_len = 0}) ->
-    {noreply, State};
+probe(_N, State = #state{pending_len = 0, name = Name}) ->
+    %% pending 为空时探测没有真实样本可用：breaker_action=drop 下熔断期间新消息
+    %% 在 hook 入口就被丢弃，pending 只出不进，verify/exhausted 状态机会永远等不到
+    %% worker 上报（1029 实测的恢复死锁形态）。配置了 probe_topic 时改发一条合成
+    %% 探针：走和真实消息完全相同的额度与 produce 链路，成功即 report_success，
+    %% 协调进程据此收敛回 healthy；失败则 park 进 pending，下一轮探测继续重试。
+    %% 未配置 probe_topic（默认 <<>>）时保持旧行为。
+    case emqx_plugin_kafka_queue:probe_topic() of
+        <<>> ->
+            {noreply, State};
+        Topic ->
+            Payload = <<"emqx-kafka-plugin-synthetic-probe">>,
+            case emqx_plugin_kafka_queue:reserve(byte_size(Payload), Name) of
+                ok ->
+                    Item = {byte_size(Payload), Topic, <<"_probe">>, Payload},
+                    {noreply, send_batch([Item], State)};
+                _ ->
+                    %% 队列额度占不到（计数已满），本轮放弃合成探针
+                    {noreply, State}
+            end
+    end;
 probe(N, State) ->
     {Batch, State1} = take_batch(State, max(1, N),
                                  emqx_plugin_kafka_queue:batch_max_bytes()),
@@ -285,8 +304,11 @@ send_groups([], _Deadline, State) ->
 send_groups([{GroupKey, Items} | Rest], Deadline, State) ->
     case remaining(Deadline) of
         0 ->
-            %% 批级预算已耗尽：剩下的消息还没发出去，按序放回队首，不丢
-            park_front(flatten(Rest), State);
+            %% 批级预算已耗尽：当前组 Items 和剩余组都还没发出去，必须一起按序
+            %% 放回队首。只放回 Rest 会漏掉当前组：消息凭空蒸发，且 reserve 已加、
+            %% release 永远不会到的额度随之永久滞留，queued 只增不减（1029 实测
+            %% 各节点泄漏 2.7k~20k），最终把 verify_timeout 的空闲逃生门也堵死。
+            park_front(Items ++ flatten(Rest), State);
         Timeout ->
             {Topic, Partition} = GroupKey,
             case send_group(Topic, Partition, Items, Timeout, State) of

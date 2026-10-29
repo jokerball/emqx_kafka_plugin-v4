@@ -28,13 +28,13 @@ Plugin Config
 - `queue_max_len` / `queue_max_bytes`：队列条数和字节数上限，超过任一上限直接丢弃并按原因计数，hook 永不阻塞；
 - `queue_report_interval`：丢弃/发送失败统计的告警间隔（ms）。日志中会输出 `full_len` / `full_bytes` / `unavailable` / `probe` / `breaker_open` 五类丢弃归因；
 - `batch_max_count` / `batch_max_bytes`：worker 单次提交到 Kafka 的条数与字节上限。worker 会先从本地 FIFO 取一批、再从邮箱里把已到达的消息并进同一批，按 `{Topic, Partition}` 分组后**每组只做一次 monitor/send/receive**，把「每条一次」的调度开销摊薄到「每组一次」，这是降低 CPU 的主要手段。邮箱为空时不会等待，单条消息的延迟不变；`batch_max_bytes` 必须明显小于 `default_producer_config` 的 `max_batch_size`，否则加上批次头开销会触发 `RecordTooLargeException`；
-- `produce_timeout` / `fail_threshold` / `probe_interval` / `probe_per_worker`：worker 侧熔断参数。**同一批内的所有分组共用一个 `produce_timeout` 预算**，不会出现「组数 × 超时」的放大；单个 worker 连续失败 `fail_threshold` 次后熔断，worker 本地也会按同阈值前置挂起，避免 Kafka 快速失败时把邮箱里的消息逐条烧完。**熔断只决定「发不发 Kafka」，不决定「收不收已入队消息」**：已入队消息 park 在 worker 本地 FIFO，恢复后按序补发；每隔 `probe_interval` 广播一次探测，每个 worker 只放行 `probe_per_worker` 条真实消息，探测成功即关闭熔断并 drain；探测窗口内若没有任何 worker 上报结果（例如 pending 为空），保底超时会自动回退到 open 并重新调度，不会卡在 probing。日志中出现 `breaker open` / `breaker closed` 可跟踪状态；
+- `produce_timeout` / `fail_threshold` / `probe_interval` / `probe_per_worker`：worker 侧熔断参数。**同一批内的所有分组共用一个 `produce_timeout` 预算**，不会出现「组数 × 超时」的放大；单个 worker 连续失败 `fail_threshold` 次后熔断，worker 本地也会按同阈值前置挂起，避免 Kafka 快速失败时把邮箱里的消息逐条烧完。**熔断只决定「发不发 Kafka」，不决定「收不收已入队消息」**：已入队消息 park 在 worker 本地 FIFO，恢复后按序补发；每隔 `probe_interval` 广播一次探测，每个 worker 只放行 `probe_per_worker` 条真实消息，探测成功即关闭熔断并 drain；探测窗口内若没有任何 worker 上报结果（例如 pending 为空），保底超时会自动回退到 open 并重新调度，不会卡在 probing。`breaker_action=drop` 下熔断期间新消息在 hook 入口被丢弃，pending 烧空后探测没有真实样本——配置 `probe_topic` 后 worker 会改发一条合成探针（key 为 `_probe`），走与真实消息相同的额度与 produce 链路，保证熔断/verify 状态机始终能拿到判定样本；日志中出现 `breaker open` / `breaker closed` 可跟踪状态；
 - `breaker_action`：熔断打开时**新到达**消息的处理方式，默认 `drop`（直接丢弃，计入 `dropped_breaker_open`），避免恢复后一次性补发一批已经过期的心跳/事件；设为 `park` 则照常入队，恢复后按序补发。已入队的消息不受该项影响，永远走 park/drain；
 - `worker_message_queue_data`：`on_heap`（默认）或 `off_heap`，积压场景可切 `off_heap` 做 A/B；
 - `forward_delivered` / `forward_acked`：是否转发 `message.delivered` / `message.acked` 事件，默认关闭。一条 MQTT 消息被 N 个订阅者消费时，这两个钩子会把 Kafka 写入量放大到 `1 + 2N` 倍；
 - 生产者参数（`required_acks`、`max_retries`、`partition_buffer_limit`、`retry_backoff_ms`、`max_linger_ms`、`max_batch_size` 等）必须写在 `kafka_config` 的 `default_producer_config` 里；写在顶层 brod 会静默忽略。插件启动时会把旧配置里的顶层生产者参数自动迁移进去，并打印 notice 日志；
 - 队列统计（`emqx_plugin_kafka_queue:stats/0`）：`queued` / `queued_bytes` 为当前积压，`buffered` 表示已进入 brod 缓冲，`acked` 表示已收到 Kafka 确认，`inflight = buffered - acked` 用于观测静默丢失；`failed` 细分为 `failed_timeout` / `failed_producer_down` / `failed_get_producer`，`dropped` 细分为 `dropped_full_len` / `dropped_full_bytes` / `dropped_unavailable` / `dropped_probe` / `dropped_breaker_open`，另有 `producer_down`、`breaker_open_count`、`breaker_open_ms`、`breaker_action`、`batch_max_count`、`batch_max_bytes`。`required_acks = 0` 时 Kafka 不回确认，`acked` 恒为 0。`queued` 是额度口径（提交超时即归还），`buffered`/`acked` 是 brod 口径；超时后才收到 buffered 回执的消息（批量模式下按组内条数）单列在 `late_buffered`。`lost = failed - late_buffered` 是提交失败且回执始终没到的条数，也就是真实丢失量，端到端对账用两个等式：`入队总量 = queued + buffered + lost`、`上游总量 = 入队总量 + dropped`。注意 `fail_threshold` 统计的是**连续失败的提交次数**，不是失败消息条数——批量提交一次失败可能涉及上百条，按条累加会让阈值失去意义。
-- client 级兜底恢复参数（`producer_down_threshold` / `producer_down_window_ms` / `ack_stall_ms` / `breaker_escalate_ms` / `rebuild_backoff_base_ms` / `rebuild_backoff_max_ms` / `rebuild_window_ms` / `max_rebuilds` / `verify_ms` / `rebuild_timeout_ms`）：见下方「client 级兜底恢复」。
+- client 级兜底恢复参数（`producer_down_threshold` / `producer_down_window_ms` / `ack_stall_ms` / `breaker_escalate_ms` / `rebuild_backoff_base_ms` / `rebuild_backoff_max_ms` / `rebuild_window_ms` / `max_rebuilds` / `verify_ms` / `rebuild_timeout_ms` / `probe_topic`）：见下方「client 级兜底恢复」。
 
 
 
@@ -63,13 +63,13 @@ healthy ──信号──> degraded ──退避到点──> rebuilding_client
 
 - 退避：`rebuild_backoff_base_ms` 起按 2 的幂递增，封顶 `rebuild_backoff_max_ms`，默认 1s→2s→4s→8s→16s→30s；
 - 重建在独立进程里执行 `brod:stop_client/1` + `brod:start_client/3`，启动参数取自插件启动时写入 `persistent_term` 的 `kafka_client_config`，协调进程本身不会被阻塞；单次重建超过 `rebuild_timeout_ms` 视为失败，进入下一轮退避；
-- 重建成功后广播 `client_rebuilt`：worker 解除对旧 producer 的监控并清表（否则旧 producer 的 DOWN 会被当成新故障，刚重建完就再次降级），协调进程清空 `{part_cnt, Topic}` 元数据缓存，然后把熔断切到 `probing` 放行 `probe_per_worker` 条真实消息做验证；
+- 重建成功后广播 `client_rebuilt`：worker 解除对旧 producer 的监控并清表（否则旧 producer 的 DOWN 会被当成新故障，刚重建完就再次降级），协调进程清空 `{part_cnt, Topic}` 元数据缓存，然后把熔断切到 `probing` 放行 `probe_per_worker` 条真实消息做验证（pending 为空且配置了 `probe_topic` 时改发合成探针，保证验证窗口始终有样本）；
 - `verify_ms` 内收到任一成功回执即回到 `healthy`，同时清零退避档位与窗口内重建计数；验证失败或超时则进入下一轮退避；
-- 验证超时但队列已空（故障期间消息全被丢弃，或业务本就空闲）时直接回到 `healthy`：没有样本可判定，不能因此再排一轮重建，否则空闲节点会一路烧到 `exhausted`。真正的链路问题会在下一条消息失败时由熔断 + 熔断升级信号重新捕获。
+- 验证超时但没有样本可判定（队列已空，或整个验证窗口 `failed` 计数未增长——后者覆盖额度计数泄漏导致 `queued` 恒大于 0 的情况）时直接回到 `healthy`：不能因此再排一轮重建，否则空闲节点会一路烧到 `exhausted`。真正的链路问题会在下一条消息失败时由熔断 + 熔断升级信号重新捕获。
 
 **放弃态**
 
-`rebuild_window_ms` 内重建次数超过 `max_rebuilds` 进入 `exhausted`：停止重建，按 `breaker_action` 继续丢弃/暂停补发，只保留 `probe_interval` 的低频探测。链路自行恢复时探测成功会自动解除；否则需要人工介入：
+`rebuild_window_ms` 内重建次数超过 `max_rebuilds` 进入 `exhausted`：停止重建，按 `breaker_action` 继续丢弃/暂停补发，只保留 `probe_interval` 的低频探测。配置了 `probe_topic` 时低频探测同样有合成探针兜底，Kafka 恢复后会自动解除放弃态；未配置且 pending 已烧空时探测永远没有样本，需要人工介入（注入一条真实消息后 `emqx_ctl kafka rebuild`，或直接配置 `probe_topic` 后重启插件）：
 
 ```
 emqx_ctl kafka recovery   # 打印状态机：state / reason / 退避进度 / 重建预算 / ack 停滞时长

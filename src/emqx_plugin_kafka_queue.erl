@@ -25,6 +25,9 @@
 %%   * 熔断只决定「发不发 Kafka」，不决定「收不收消息」：熔断期间消息在 worker
 %%     本地 park，恢复后按 FIFO 补发；
 %%   * 探测改为每个 worker 每次只放行 probe_per_worker 条，避免探测期全量灌入。
+%%   * pending 为空的探测窗口改发合成探针（probe_topic 配置项）：drop 模式下熔断
+%%     期间新消息在入口就被丢弃，队列烧空后没有真实样本可探测，verify/exhausted
+%%     状态机会死等 worker 上报；合成探针走与真实消息相同的额度与链路。
 %%
 %% 本进程只处理统计、熔断和广播，不参与消息转发，因此不会成为吞吐瓶颈。
 -module(emqx_plugin_kafka_queue).
@@ -42,11 +45,13 @@
         , accepting/0
         , release/2
         , release_batch/3
+        , reserve/2
         , breaker_state/0
         , breaker_action/0
         , produce_timeout/0
         , fail_threshold/0
         , probe_per_worker/0
+        , probe_topic/0
         , batch_max_count/0
         , batch_max_bytes/0
         , worker_names/0
@@ -167,6 +172,10 @@
                 rebuild_timeout_tref :: reference() | undefined,
                 rebuild_epoch = 0 :: non_neg_integer(),
                 verify_tref :: reference() | undefined,
+                %% verify 窗口起始时的 failed 基线：超时且 failed 未增长说明整个窗口
+                %% 没有任何探测样本被消费，等价于「队列空」的空闲判定（queued 可能
+                %% 含历史泄漏计数，不能单独作判据）
+                verify_base_failed = 0 :: non_neg_integer(),
                 %% ack 停滞检测：inflight > 0 且 acked 连续不增长即判定 client 半死
                 last_acked = 0 :: non_neg_integer(),
                 ack_stall_since = undefined :: integer() | undefined,
@@ -392,6 +401,11 @@ fail_threshold() ->
 probe_per_worker() ->
     persistent_term:get({?MODULE, probe_per_worker}, ?DEFAULT_PROBE_PER_WORKER).
 
+%% 合成探针的目标 topic；<<>> 表示关闭：pending 为空的探测窗口不发合成消息
+-spec probe_topic() -> binary().
+probe_topic() ->
+    persistent_term:get({?MODULE, probe_topic}, <<>>).
+
 %% 单次提交到 Kafka 的最大条数/字节数，worker 按 {Topic, Partition} 分组后一组一次提交
 -spec batch_max_count() -> pos_integer().
 batch_max_count() ->
@@ -436,6 +450,8 @@ init([]) ->
                         max(1, env(batch_max_bytes, ?DEFAULT_BATCH_MAX_BYTES))),
     persistent_term:put({?MODULE, breaker_action},
                         normalize_breaker_action(env(breaker_action, ?DEFAULT_BREAKER_ACTION))),
+    persistent_term:put({?MODULE, probe_topic},
+                        normalize_probe_topic(env(probe_topic, <<>>))),
     persistent_term:put({?MODULE, ack_stall_ms},
                         max(1, env(ack_stall_ms, ?DEFAULT_ACK_STALL_MS))),
     persistent_term:put({?MODULE, breaker_escalate_ms},
@@ -627,12 +643,17 @@ handle_info({rebuild_timeout, _Epoch}, State) ->
     {noreply, State};
 handle_info(verify_timeout, State = #state{recovery = verifying}) ->
     cancel_timer(State#state.probe_timeout_tref),
-    case queued() of
-        0 ->
-            %% 队列已空（故障期间消息全被丢弃或业务本就空闲），没有样本可判定。
+    %% 空闲判定不能只看 queued()：泄漏的残留计数会让它恒大于 0（1029 实测各节点
+    %% 2.7k~20k），把「队列已空」的逃生门堵死，空闲节点会一路烧到 exhausted。
+    %% 补充判据：整个 verify 窗口 failed 基线未动 = 没有任何探测样本被消费。
+    NoSample = queued() =:= 0
+        orelse counter(?FAILED) =:= State#state.verify_base_failed,
+    case NoSample of
+        true ->
+            %% 没有样本可判定（故障期间消息全被丢弃或业务本就空闲）。
             %% 不能因此再排一轮重建，否则空闲节点会一路烧到 exhausted。
             {noreply, verify_no_traffic(State)};
-        _ ->
+        false ->
             ?LOG_ERROR("[KAFKA PLUGIN]client verification timed out after ~pms without success",
                        [verify_ms()]),
             {noreply, enter_degraded(verify_timeout, State#state{verify_tref = undefined})}
@@ -701,6 +722,14 @@ close_breaker(State = #state{open_at = OpenAt}) ->
     ?LOG_NOTICE("[KAFKA PLUGIN]kafka recovered, breaker closed, draining parked messages"),
     State#state{breaker = closed, probe_tref = undefined, probe_timeout_tref = undefined,
                 open_at = undefined}.
+
+%% set_breaker 只写 ETS 一行，state 里的 breaker/open_at 字段必须随每次状态转换
+%% 同步更新：否则 handle_info(probe) 按 state.breaker 分流会永久错过探测消息
+%% （1029 实测：state.breaker 卡在 probing，探针循环整体冻结，只能手动解锁）。
+open_at_or_now(#state{open_at = undefined}) ->
+    now_ms();
+open_at_or_now(#state{open_at = Ts}) ->
+    Ts.
 
 handle_produce_failed(Streak, Reason, State = #state{breaker = closed}) ->
     case Streak >= fail_threshold() of
@@ -812,6 +841,10 @@ schedule_rebuild(Reason, State) ->
                        [Reason, Delay, State#state.rebuild_attempt + 1,
                         length(Times), max_rebuilds(), rebuild_window_ms()]),
             State#state{recovery = degraded,
+                        breaker = open,
+                        open_at = open_at_or_now(State),
+                        probe_tref = undefined,
+                        probe_timeout_tref = undefined,
                         recovery_reason = Reason,
                         recovery_since = Now,
                         rebuild_times = Times,
@@ -837,6 +870,9 @@ exhausted_state(Reason, Times, State) ->
                "(last reason ~p), drop/park continues, manual rebuild required",
                [length(Times), rebuild_window_ms(), Reason]),
     State#state{recovery = exhausted,
+                breaker = open,
+                open_at = open_at_or_now(State),
+                probe_timeout_tref = undefined,
                 recovery_reason = {exhausted, Reason},
                 recovery_since = now_ms(),
                 rebuild_times = Times,
@@ -861,6 +897,8 @@ enter_verifying(State = #state{rebuild_epoch = Epoch}) ->
     ?LOG_NOTICE("[KAFKA PLUGIN]client rebuilt (epoch ~p), verifying with ~p probe msg/worker",
                 [Epoch, probe_per_worker()]),
     State#state{recovery = verifying,
+                breaker = probing,
+                verify_base_failed = counter(?FAILED),
                 recovery_since = now_ms(),
                 rebuild_tref = undefined,
                 rebuild_timeout_tref = undefined,
@@ -922,6 +960,10 @@ manual_rebuild_now(State) ->
     ?LOG_WARNING("[KAFKA PLUGIN]manual rebuild requested, recovery state reset"),
     TRef = erlang:send_after(0, self(), rebuild),
     State#state{recovery = degraded,
+                breaker = open,
+                open_at = open_at_or_now(State),
+                probe_tref = undefined,
+                probe_timeout_tref = undefined,
                 recovery_reason = manual,
                 recovery_since = now_ms(),
                 rebuild_attempt = 0,
@@ -1164,6 +1206,17 @@ normalize_breaker_action(Other) ->
     ?LOG_WARNING("[KAFKA PLUGIN]invalid breaker_action ~p, fallback to ~p",
                  [Other, ?DEFAULT_BREAKER_ACTION]),
     ?DEFAULT_BREAKER_ACTION.
+
+%% probe_topic 兼容 list/binary 两种写法；非法取值一律视为关闭并告警，
+%% 不能让一条坏配置把合成探针发到不存在的 topic 上反复拉开熔断。
+normalize_probe_topic(<<>>) -> <<>>;
+normalize_probe_topic(T) when is_binary(T) -> T;
+normalize_probe_topic(T) when is_list(T) ->
+    normalize_probe_topic(iolist_to_binary(T));
+normalize_probe_topic(Other) ->
+    ?LOG_WARNING("[KAFKA PLUGIN]invalid probe_topic ~p, synthetic probe disabled",
+                 [Other]),
+    <<>>.
 
 env(Key, Default) ->
     application:get_env(emqx_plugin_kafka, Key, Default).
